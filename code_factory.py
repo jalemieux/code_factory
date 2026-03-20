@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import re
@@ -50,7 +49,7 @@ def git(*args: str) -> str:
 
 
 def slugify(title: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:40]
+    return re.sub(r"[^a-z0-9]+", "-", title.lower())[:40].strip("-")
 
 
 def ensure_labels(repo: str) -> None:
