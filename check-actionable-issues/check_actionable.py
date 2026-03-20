@@ -102,13 +102,14 @@ def check_unclaimed_issues(repo: str) -> list[dict]:
     issues = gh_json(
         "issue", "list",
         "--repo", repo,
-        "--assignee", "",
         "--state", "open",
-        "--json", "number,title,labels",
+        "--json", "number,title,labels,assignees",
         "--limit", "20",
     )
     actionable = []
     for issue in issues:
+        if issue.get("assignees"):
+            continue
         linked_prs = gh_json(
             "pr", "list", "--repo", repo,
             "--search", f"#{issue['number']}",
