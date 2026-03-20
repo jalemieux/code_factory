@@ -6,17 +6,25 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import time
 
 
 def gh(*args: str) -> str:
-    """Run a gh CLI command and return stdout."""
-    result = subprocess.run(
-        ["gh", *args],
-        capture_output=True, text=True
-    )
-    if result.returncode != 0:
+    """Run a gh CLI command and return stdout, retrying on rate limits."""
+    for attempt in range(4):
+        result = subprocess.run(
+            ["gh", *args],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+        if "rate limit" in result.stderr.lower() and attempt < 3:
+            wait = 2 ** attempt * 15  # 15s, 30s, 60s
+            print(f"  Rate limited, retrying in {wait}s...", file=sys.stderr)
+            time.sleep(wait)
+            continue
         raise RuntimeError(f"gh {' '.join(args)} failed: {result.stderr.strip()}")
-    return result.stdout.strip()
+    return ""
 
 
 def gh_json(*args: str) -> list | dict:
@@ -92,9 +100,9 @@ def check_accepted_plans(repo: str) -> list[dict]:
 def check_unclaimed_issues(repo: str) -> list[dict]:
     """Priority 4: Unassigned open issues with no linked PRs."""
     issues = gh_json(
-        "search", "issues",
+        "issue", "list",
         "--repo", repo,
-        "--no-assignee",
+        "--assignee", "",
         "--state", "open",
         "--json", "number,title,labels",
         "--limit", "20",

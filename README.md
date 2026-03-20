@@ -82,6 +82,7 @@ This will:
 - Poll every **5 minutes** for actionable work
 - When work is found, launch `claude --dangerously-skip-permissions` to run the `git-contribute` skill
 - Sleep **5 seconds** between dispatches when work exists, **5 minutes** when idle
+- Automatically retry with exponential backoff if GitHub rate-limits a request
 
 ### Run git-contribute directly
 
