@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="banner.png" alt="Code Factory" width="100%">
+  <img src="code_factory.png" alt="Code Factory" width="100%">
 </p>
 
 # Code Factory
