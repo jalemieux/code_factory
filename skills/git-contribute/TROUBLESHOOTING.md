@@ -171,7 +171,7 @@ Run before first deployment or after environment changes:
 
 1. **Auth identity:** `gh auth status` — confirm the bot account, not your personal account
 2. **Repo access:** `gh repo view {repo}` — confirm the bot can see the repo
-3. **Labels:** `gh label list --repo {repo} --search "bot:"` — all three labels exist
+3. **Labels:** `gh label list --repo {repo} --search "bot:"` — all four labels exist
 4. **Permissions:** bot account can push branches, create PRs, edit labels, assign issues
 5. **Claude Code:** `claude --version` — installed and accessible from the run loop
 6. **Skill available:** the `git-contribute` skill is loadable by Claude Code
