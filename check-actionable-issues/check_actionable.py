@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Check if a GitHub repo has issues/PRs actionable by the git-contribute workflow."""
 
+from __future__ import annotations
+
 import json
 import subprocess
 import sys
@@ -50,29 +52,30 @@ def check_review_requested(repo: str) -> list[dict]:
 
 
 def check_plan_feedback(repo: str) -> list[dict]:
-    """Priority 2: Own draft PRs with plan feedback awaiting processing."""
+    """Priority 2: Own draft PRs with plan feedback awaiting processing.
+
+    Matches git-contribute's routing: only draft PRs with bot:plan-proposed
+    label that have comments from humans (not the PR author).
+    """
     prs = gh_json(
         "pr", "list", "--repo", repo,
         "--author", "@me",
-        "--label", "bot:plan-proposed",
         "--draft",
-        "--json", "number,title,comments",
+        "--label", "bot:plan-proposed",
+        "--json", "number,title",
     )
     actionable = []
     for pr in prs:
         comments = gh_json(
             "pr", "view", str(pr["number"]), "--repo", repo,
-            "--json", "comments",
-            "--jq", "[.comments[] | .author.login]",
+            "--json", "comments,author",
+            "--jq", '{pr_author: .author.login, comments: [.comments[] | {author: .author.login, body: .body}]}',
         )
-        # Get the PR author to filter out self-comments
-        pr_author = gh(
-            "pr", "view", str(pr["number"]), "--repo", repo,
-            "--json", "author", "--jq", ".author.login",
-        )
-        human_comments = [c for c in comments if c != pr_author]
-        if human_comments:
-            actionable.append(pr)
+        pr_author = comments.get("pr_author", "")
+        for comment in comments.get("comments", []):
+            if comment.get("author") != pr_author:
+                actionable.append(pr)
+                break
     return actionable
 
 
@@ -136,7 +139,7 @@ def main():
     prs = check_plan_feedback(repo)
     if prs:
         found_any = True
-        print(f"[Priority 2] Draft PRs with plan feedback ({len(prs)}):")
+        print(f"[Priority 2] PRs with plan feedback ({len(prs)}):")
         for pr in prs:
             print(f"  #{pr['number']} — {pr['title']}")
         print()
