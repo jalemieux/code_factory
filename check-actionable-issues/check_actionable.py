@@ -55,7 +55,10 @@ def check_plan_feedback(repo: str) -> list[dict]:
     """Priority 2: Own draft PRs with plan feedback awaiting processing.
 
     Matches git-contribute's routing: only draft PRs with bot:plan-proposed
-    label that have comments from humans (not the PR author).
+    label that have any comments. Since the bot creates the PR description
+    (not comments), any comment on a plan PR is human feedback — even if
+    the comment author matches the PR author (common when the bot and human
+    share the same GitHub account).
     """
     prs = gh_json(
         "pr", "list", "--repo", repo,
@@ -66,16 +69,13 @@ def check_plan_feedback(repo: str) -> list[dict]:
     )
     actionable = []
     for pr in prs:
-        comments = gh_json(
+        comment_count = gh_json(
             "pr", "view", str(pr["number"]), "--repo", repo,
-            "--json", "comments,author",
-            "--jq", '{pr_author: .author.login, comments: [.comments[] | {author: .author.login, body: .body}]}',
+            "--json", "comments",
+            "--jq", ".comments | length",
         )
-        pr_author = comments.get("pr_author", "")
-        for comment in comments.get("comments", []):
-            if comment.get("author") != pr_author:
-                actionable.append(pr)
-                break
+        if comment_count and comment_count > 0:
+            actionable.append(pr)
     return actionable
 
 
