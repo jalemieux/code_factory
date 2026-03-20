@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="banner.png" alt="Code Factory" width="100%">
+</p>
+
 # Code Factory
 
 Automation that turns GitHub issues into merged PRs with human oversight, powered by [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and the `git-contribute` skill.
