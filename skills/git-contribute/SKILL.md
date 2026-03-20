@@ -171,22 +171,35 @@ Load the plan, then invoke superpowers skills in sequence:
 4. **TDD** — invoke `test-driven-development` for each component
 5. **Debug** — invoke `systematic-debugging` if any tests fail
 6. **Verify** — invoke `verification-before-completion` before declaring done
+7. **Push from worktree** — push commits to the remote BEFORE exiting the worktree. Worktree cleanup may delete the local branch and its commits.
+   ```bash
+   git push origin HEAD:bot/{issue_num}-{slug}
+   ```
 
 After all steps pass → **Phase 5**
 
 ### Phase 5: Post Implementation
 
-1. Push all commits to the PR branch
-2. Convert from draft and relabel:
+1. Push all commits to the PR branch (if not already pushed from worktree in Phase 4 step 7)
+2. **Verify push landed** — confirm the implementation commits exist on the remote before proceeding. **Do not continue if this check fails.**
+   ```bash
+   gh pr view {num} --json commits --jq '.commits[-1].oid'
+   ```
+   Compare the latest commit SHA against what you pushed. Also verify changed files are present:
+   ```bash
+   gh pr view {num} --json changedFiles --jq '.changedFiles'
+   ```
+   If `changedFiles` is 0 or the commit SHA doesn't match, the push failed — diagnose and retry. **Never mark a PR ready with 0 changed files.**
+3. Convert from draft and relabel:
    ```bash
    gh pr ready {num}
    gh pr edit {num} --remove-label "bot:plan-accepted" --add-label "bot:review-requested"
    ```
-3. Post a summary comment:
+4. Post a summary comment:
    - What was implemented
    - Any deviations from the plan (and why)
    - Test results / CI status
-4. **Exit** — wait for review.
+5. **Exit** — wait for review.
 
 ### Phase 6: Process Code Review
 
@@ -229,4 +242,5 @@ After all steps pass → **Phase 5**
 - **Force-pushing** — never force-push to a PR branch with review comments. It destroys review context.
 - **Treating silence as approval** — "no new comments" does not mean approved. Only explicit approval triggers Phase 4.
 - **Skipping verification** — always run `verification-before-completion` before posting. Don't claim "tests pass" without evidence.
+- **Marking PR ready before verifying push** — always confirm commits exist on the remote (`gh pr view --json changedFiles`) before calling `gh pr ready`. Worktree cleanup can destroy unpushed commits.
 - **Merging without explicit approval** — only merge when the reviewer has approved via GitHub's review system, not just a comment.
