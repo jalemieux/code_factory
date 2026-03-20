@@ -92,3 +92,90 @@ class TestLoadPrompt(unittest.TestCase):
                 self.assertEqual(result, '{"action": "approve"}')
             finally:
                 code_factory.PROMPTS_DIR = original
+
+
+class TestCheckReviewRequested(unittest.TestCase):
+    @patch("code_factory.gh_json")
+    def test_returns_pr_when_review_newer_than_commit(self, mock_gh_json):
+        mock_gh_json.side_effect = [
+            [{"number": 5, "title": "Fix", "updatedAt": "2026-01-01"}],
+            {"last_review": "2026-03-20T10:00:00Z", "last_commit": "2026-03-19T10:00:00Z"},
+        ]
+        result = code_factory.check_review_requested("owner/repo")
+        self.assertEqual(result, [{"number": 5, "title": "Fix", "updatedAt": "2026-01-01"}])
+
+    @patch("code_factory.gh_json")
+    def test_skips_pr_when_commit_newer_than_review(self, mock_gh_json):
+        mock_gh_json.side_effect = [
+            [{"number": 5, "title": "Fix", "updatedAt": "2026-01-01"}],
+            {"last_review": "2026-03-19T10:00:00Z", "last_commit": "2026-03-20T10:00:00Z"},
+        ]
+        result = code_factory.check_review_requested("owner/repo")
+        self.assertEqual(result, [])
+
+
+class TestCheckUnclaimed(unittest.TestCase):
+    @patch("code_factory.gh_json")
+    def test_skips_assigned_issues(self, mock_gh_json):
+        mock_gh_json.return_value = [
+            {"number": 1, "title": "Bug", "labels": [], "assignees": [{"login": "bob"}]},
+        ]
+        result = code_factory.check_unclaimed_issues("owner/repo")
+        self.assertEqual(result, [])
+
+    @patch("code_factory.gh_json")
+    def test_skips_issues_with_open_prs(self, mock_gh_json):
+        mock_gh_json.side_effect = [
+            [{"number": 1, "title": "Bug", "labels": [], "assignees": []}],
+            1,
+        ]
+        result = code_factory.check_unclaimed_issues("owner/repo")
+        self.assertEqual(result, [])
+
+    @patch("code_factory.gh_json")
+    def test_returns_unassigned_issue_with_no_prs(self, mock_gh_json):
+        mock_gh_json.side_effect = [
+            [{"number": 1, "title": "Bug", "labels": [], "assignees": []}],
+            0,
+        ]
+        result = code_factory.check_unclaimed_issues("owner/repo")
+        self.assertEqual(result, [{"number": 1, "title": "Bug", "labels": [], "assignees": []}])
+
+
+class TestRoute(unittest.TestCase):
+    @patch("code_factory.check_unclaimed_issues", return_value=[])
+    @patch("code_factory.check_accepted_plans", return_value=[])
+    @patch("code_factory.check_plan_feedback", return_value=[])
+    @patch("code_factory.check_review_requested", return_value=[])
+    @patch("code_factory.get_in_progress_prs", return_value=set())
+    def test_returns_none_when_no_work(self, *_):
+        self.assertIsNone(code_factory.route("owner/repo"))
+
+    @patch("code_factory.check_unclaimed_issues")
+    @patch("code_factory.check_accepted_plans", return_value=[])
+    @patch("code_factory.check_plan_feedback", return_value=[])
+    @patch("code_factory.check_review_requested", return_value=[{"number": 5, "title": "Fix"}])
+    @patch("code_factory.get_in_progress_prs", return_value=set())
+    def test_priority1_takes_precedence(self, _, mock_review, *__):
+        result = code_factory.route("owner/repo")
+        self.assertEqual(result[0], "phase6_process_review")
+        self.assertEqual(result[1]["pr"]["number"], 5)
+
+    @patch("code_factory.check_unclaimed_issues", return_value=[{"number": 10, "title": "New"}])
+    @patch("code_factory.check_accepted_plans", return_value=[])
+    @patch("code_factory.check_plan_feedback", return_value=[])
+    @patch("code_factory.check_review_requested", return_value=[])
+    @patch("code_factory.get_in_progress_prs", return_value=set())
+    def test_priority4_returns_issue(self, *_):
+        result = code_factory.route("owner/repo")
+        self.assertEqual(result[0], "phase1_claim_and_plan")
+        self.assertEqual(result[1]["issue"]["number"], 10)
+
+    @patch("code_factory.check_unclaimed_issues")
+    @patch("code_factory.check_accepted_plans", return_value=[])
+    @patch("code_factory.check_plan_feedback", return_value=[])
+    @patch("code_factory.check_review_requested", return_value=[{"number": 5, "title": "Fix"}])
+    @patch("code_factory.get_in_progress_prs", return_value={5})
+    def test_in_progress_pr_excluded(self, *_):
+        result = code_factory.route("owner/repo")
+        self.assertIsNone(result)
