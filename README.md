@@ -6,7 +6,7 @@ Automation that turns GitHub issues into merged PRs with human oversight, powere
 
 ```bash
 cd /path/to/your-repo
-/Users/jac/Dev/src/code_factory/check-actionable-issues/run_loop.sh
+/path/to/code_factory/check-actionable-issues/run_loop.sh
 ```
 
 That's it. The loop will poll for open issues, propose plans as draft PRs, and implement after you approve.
