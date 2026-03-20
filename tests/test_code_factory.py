@@ -179,3 +179,89 @@ class TestRoute(unittest.TestCase):
     def test_in_progress_pr_excluded(self, *_):
         result = code_factory.route("owner/repo")
         self.assertIsNone(result)
+
+
+class TestParseClaudeJson(unittest.TestCase):
+    def test_parses_plain_json(self):
+        result = code_factory.parse_claude_json('{"action": "approve"}')
+        self.assertEqual(result, {"action": "approve"})
+
+    def test_parses_json_in_code_block(self):
+        result = code_factory.parse_claude_json('```json\n{"action": "approve"}\n```')
+        self.assertEqual(result, {"action": "approve"})
+
+    def test_parses_json_in_plain_code_block(self):
+        result = code_factory.parse_claude_json('```\n{"action": "noop"}\n```')
+        self.assertEqual(result, {"action": "noop"})
+
+    def test_returns_none_for_invalid_json(self):
+        self.assertIsNone(code_factory.parse_claude_json("not json"))
+
+    def test_returns_none_for_empty_string(self):
+        self.assertIsNone(code_factory.parse_claude_json(""))
+
+
+class TestPhase5(unittest.TestCase):
+    @patch("code_factory.remove_in_progress")
+    @patch("code_factory.swap_label")
+    @patch("code_factory.gh")
+    @patch("code_factory.gh_json")
+    def test_marks_ready_when_files_changed(self, mock_json, mock_gh, mock_swap, mock_remove):
+        mock_json.return_value = 3
+        result = code_factory.phase5_post_implementation(
+            repo="owner/repo", pr={"number": 5, "title": "Fix"}
+        )
+        self.assertIsNone(result)
+        mock_gh.assert_any_call("pr", "ready", "5", "--repo", "owner/repo")
+        mock_swap.assert_called_once_with("owner/repo", 5, "bot:plan-accepted", "bot:review-requested")
+        mock_remove.assert_called_once_with("owner/repo", 5)
+
+    @patch("code_factory.gh_json")
+    def test_raises_when_no_files_changed(self, mock_json):
+        mock_json.return_value = 0
+        with self.assertRaises(RuntimeError) as ctx:
+            code_factory.phase5_post_implementation(
+                repo="owner/repo", pr={"number": 5, "title": "Fix"}
+            )
+        self.assertIn("0 changed files", str(ctx.exception))
+
+
+class TestPhase2(unittest.TestCase):
+    @patch("code_factory.claude")
+    @patch("code_factory.gh")
+    @patch("code_factory.swap_label")
+    @patch("code_factory.add_in_progress")
+    def test_approve_chains_to_phase4(self, mock_add, mock_swap, mock_gh, mock_claude):
+        mock_gh.return_value = "user1 (2026-03-20): LGTM"
+        mock_claude.return_value = '{"action": "approve", "summary": "approved"}'
+        result = code_factory.phase2_process_feedback(
+            repo="owner/repo", pr={"number": 5, "title": "Fix"}
+        )
+        self.assertEqual(result[0], "phase4_implement")
+        mock_swap.assert_called_once_with("owner/repo", 5, "bot:plan-proposed", "bot:plan-accepted")
+
+    @patch("code_factory.claude")
+    @patch("code_factory.gh")
+    @patch("code_factory.remove_in_progress")
+    @patch("code_factory.add_in_progress")
+    def test_noop_returns_none(self, mock_add, mock_remove, mock_gh, mock_claude):
+        mock_gh.return_value = ""
+        mock_claude.return_value = '{"action": "noop", "summary": "no feedback"}'
+        result = code_factory.phase2_process_feedback(
+            repo="owner/repo", pr={"number": 5, "title": "Fix"}
+        )
+        self.assertIsNone(result)
+        mock_remove.assert_called_once_with("owner/repo", 5)
+
+    @patch("code_factory.claude")
+    @patch("code_factory.gh")
+    @patch("code_factory.remove_in_progress")
+    @patch("code_factory.add_in_progress")
+    def test_malformed_json_returns_none(self, mock_add, mock_remove, mock_gh, mock_claude):
+        mock_gh.return_value = ""
+        mock_claude.return_value = "not json at all"
+        result = code_factory.phase2_process_feedback(
+            repo="owner/repo", pr={"number": 5, "title": "Fix"}
+        )
+        self.assertIsNone(result)
+        mock_remove.assert_called_once_with("owner/repo", 5)
