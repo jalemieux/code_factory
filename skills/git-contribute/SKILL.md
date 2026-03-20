@@ -187,33 +187,62 @@ Load the plan, then invoke superpowers skills in sequence:
 6. **Verify** — invoke `verification-before-completion` before declaring done
 7. **Push from worktree** — push commits to the remote BEFORE exiting the worktree. Worktree cleanup may delete the local branch and its commits.
    ```bash
-   git push origin HEAD:bot/{issue_num}-{slug}
+   # Determine the correct remote (may not be "origin")
+   remote=$(git remote -v | grep -F '{owner/repo}' | grep push | head -1 | awk '{print $1}')
+   git push "$remote" HEAD:bot/{issue_num}-{slug}
    ```
+   Record the pushed commit SHA (`git rev-parse HEAD`) — you will need it in Phase 5.
 
 After all steps pass → **Phase 5**
 
 ### Phase 5: Post Implementation
 
 1. Push all commits to the PR branch (if not already pushed from worktree in Phase 4 step 7)
-2. **Verify push landed** — confirm the implementation commits exist on the remote before proceeding. **Do not continue if this check fails.**
+
+2. **GATE — Verify push landed.** This is a blocking precondition. Do NOT proceed to step 3 until this gate passes.
+
+   GitHub's PR view can lag behind the actual branch ref. Retry up to 3 times with a 10-second delay between attempts:
    ```bash
-   gh pr view {num} --json commits --jq '.commits[-1].oid'
+   expected_sha="{SHA recorded in Phase 4 step 7}"
+   for attempt in 1 2 3; do
+     pr_head=$(gh pr view {num} --json commits --jq '.commits[-1].oid')
+     changed=$(gh pr view {num} --json changedFiles --jq '.changedFiles')
+     if [ "$changed" -gt 0 ] && [ "$pr_head" = "$expected_sha" ]; then
+       break  # Gate passes
+     fi
+     sleep 10
+   done
    ```
-   Compare the latest commit SHA against what you pushed. Also verify changed files are present:
+   If after 3 attempts `changedFiles` is still 0 or `pr_head` doesn't match: **STOP. Do not proceed.** Cross-check with the git ref API:
    ```bash
-   gh pr view {num} --json changedFiles --jq '.changedFiles'
+   gh api repos/{owner/repo}/git/refs/heads/bot/{issue_num}-{slug} --jq '.object.sha'
    ```
-   If `changedFiles` is 0 or the commit SHA doesn't match, the push failed — diagnose and retry. **Never mark a PR ready with 0 changed files.**
-3. Convert from draft and relabel:
+   If the ref matches but the PR doesn't — the push landed but GitHub's PR hasn't synced. Post a diagnostic comment on the PR and **exit**. Do not mark ready.
+
+   If the ref doesn't match — the push did not land. Diagnose (wrong remote? auth failure?) and re-push.
+
+3. **Transition** — only after the gate in step 2 passes:
    ```bash
    gh pr ready {num}
    gh pr edit {num} --remove-label "bot:plan-accepted" --add-label "bot:review-requested"
    ```
-4. Post a summary comment:
+
+4. **Post-transition verification** — confirm the PR is in the expected state after the transition:
+   ```bash
+   gh pr view {num} --json changedFiles,isDraft --jq '{changedFiles, isDraft}'
+   ```
+   Expected: `changedFiles > 0` and `isDraft: false`. If `changedFiles` is 0, roll back:
+   ```bash
+   gh pr ready {num} --undo
+   gh pr edit {num} --remove-label "bot:review-requested" --add-label "bot:plan-accepted"
+   ```
+   Then **exit** with a diagnostic comment.
+
+5. Post a summary comment:
    - What was implemented
    - Any deviations from the plan (and why)
    - Test results / CI status
-5. **Exit** — wait for review.
+6. **Exit** — wait for review.
 
 ### Phase 6: Process Code Review
 
@@ -260,5 +289,6 @@ When routing finds no work, a PR is stuck, or state looks wrong, consult [TROUBL
 - **Force-pushing** — never force-push to a PR branch with review comments. It destroys review context.
 - **Treating silence as approval** — "no new comments" does not mean approved. Only explicit approval triggers Phase 4.
 - **Skipping verification** — always run `verification-before-completion` before posting. Don't claim "tests pass" without evidence.
-- **Marking PR ready before verifying push** — always confirm commits exist on the remote (`gh pr view --json changedFiles`) before calling `gh pr ready`. Worktree cleanup can destroy unpushed commits.
+- **Marking PR ready before verifying push** — Phase 5 step 2 is a GATE, not a suggestion. Never call `gh pr ready` until `changedFiles > 0` AND the commit SHA matches. `gh pr view` can be stale — retry with delay, cross-check with the git ref API, and roll back if post-transition verification fails.
+- **Hardcoding remote name** — don't assume the remote is `origin`. Determine it dynamically from `git remote -v` by matching the `{owner/repo}` slug.
 - **Merging without explicit approval** — only merge when the reviewer has approved via GitHub's review system, not just a comment.
