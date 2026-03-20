@@ -124,6 +124,17 @@ def check_unclaimed_issues(repo: str) -> list[dict]:
     return actionable
 
 
+def get_in_progress_prs(repo: str) -> set[int]:
+    """Get PR numbers currently being processed by another instance."""
+    prs = gh_json(
+        "pr", "list", "--repo", repo,
+        "--author", "@me",
+        "--label", "bot:in-progress",
+        "--json", "number",
+    )
+    return {pr["number"] for pr in prs}
+
+
 def main():
     repo = sys.argv[1] if len(sys.argv) > 1 else None
     try:
@@ -133,10 +144,16 @@ def main():
         sys.exit(1)
 
     print(f"Checking repo: {repo}\n")
+
+    in_progress = get_in_progress_prs(repo)
+    if in_progress:
+        print(f"PRs in progress (skipping): {', '.join(f'#{n}' for n in sorted(in_progress))}\n")
+
     found_any = False
 
     # Priority 1
     prs = check_review_requested(repo)
+    prs = [pr for pr in prs if pr["number"] not in in_progress]
     if prs:
         found_any = True
         print(f"[Priority 1] PRs with review feedback ({len(prs)}):")
@@ -146,6 +163,7 @@ def main():
 
     # Priority 2
     prs = check_plan_feedback(repo)
+    prs = [pr for pr in prs if pr["number"] not in in_progress]
     if prs:
         found_any = True
         print(f"[Priority 2] PRs with plan feedback ({len(prs)}):")
@@ -155,6 +173,7 @@ def main():
 
     # Priority 3
     prs = check_accepted_plans(repo)
+    prs = [pr for pr in prs if pr["number"] not in in_progress]
     if prs:
         found_any = True
         print(f"[Priority 3] Accepted plans ready for implementation ({len(prs)}):")

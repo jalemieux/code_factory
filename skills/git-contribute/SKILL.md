@@ -72,6 +72,20 @@ Skip any issue where this returns > 0. If candidates remain → **Phase 1**
 
 **Nothing found** → exit: "No actionable work found."
 
+### Work Claiming
+
+When entering any phase that processes an existing PR (Phases 2, 3, 4, 5, 6), **immediately** add `bot:in-progress` before doing any other work:
+```bash
+gh pr edit {num} --add-label "bot:in-progress"
+```
+
+Before every **exit** (returning to wait for human feedback), remove it:
+```bash
+gh pr edit {num} --remove-label "bot:in-progress"
+```
+
+This prevents concurrent loop instances from picking up the same PR. Do NOT remove the label between phases that chain within the same invocation (e.g., Phase 2 → Phase 4 → Phase 5).
+
 ### Phase 1: Claim & Plan
 
 1. Pick ONE issue (prefer labels: `good-first-issue`, `help-wanted`)
@@ -104,7 +118,7 @@ Skip any issue where this returns > 0. If candidates remain → **Phase 1**
    ```
 6. Ensure labels exist (first-time only — safe to repeat, **must run before creating the PR**):
    ```bash
-   for label in "bot:plan-proposed" "bot:plan-accepted" "bot:review-requested"; do
+   for label in "bot:plan-proposed" "bot:plan-accepted" "bot:in-progress" "bot:review-requested"; do
      gh label create "$label" --description "Managed by git-contribute" --color "0E8A16" --force 2>/dev/null
    done
    ```
