@@ -493,6 +493,7 @@ PHASES: dict[str, callable] = {
 
 def bootstrap_repo(repo: str) -> None:
     """Ensure the repo is cloned and default branch is synced."""
+    # Check if we're already inside the target repo
     try:
         current_repo = gh("repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner")
         if current_repo == repo:
@@ -505,10 +506,16 @@ def bootstrap_repo(repo: str) -> None:
             return
     except RuntimeError:
         pass
-    gh("repo", "clone", repo)
+    # Not inside the repo — clone it or enter existing clone
     repo_name = repo.split("/")[-1]
-    os.chdir(repo_name)
-    log(f"Cloned and entered {repo}")
+    if os.path.isdir(repo_name):
+        os.chdir(repo_name)
+        git("pull", "--ff-only")
+        log(f"Entered existing clone: {repo}")
+    else:
+        gh("repo", "clone", repo)
+        os.chdir(repo_name)
+        log(f"Cloned and entered {repo}")
 
 
 def main() -> None:
