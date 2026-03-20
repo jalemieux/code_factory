@@ -152,7 +152,7 @@ gh pr list --repo {repo} --search "#{issue_num}" --state open --json number,stat
 ### Bot labels don't exist
 
 ```bash
-for label in "bot:plan-proposed" "bot:plan-accepted" "bot:review-requested"; do
+for label in "bot:plan-proposed" "bot:plan-accepted" "bot:in-progress" "bot:review-requested"; do
   gh label create "$label" --repo {repo} --description "Managed by git-contribute" --color "0E8A16" --force
 done
 ```

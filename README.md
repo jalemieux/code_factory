@@ -4,28 +4,25 @@
 
 # Code Factory
 
-Automation that turns GitHub issues into merged PRs with human oversight, powered by [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and the `git-contribute` skill.
+Automation that turns GitHub issues into merged PRs with human oversight, powered by [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
 
 ## Quick Start
 
 ```bash
-cd /path/to/your-repo
-/path/to/code_factory/check-actionable-issues/run_loop.sh
-```
+# Continuous polling (runs until stopped)
+python3 code_factory.py --repo owner/repo
 
-That's it. The loop will poll for open issues, propose plans as draft PRs, and implement after you approve.
+# Single pass (process one item and exit)
+python3 code_factory.py --once --repo owner/repo
+
+# Auto-detect repo from current directory
+cd /path/to/your-repo
+python3 /path/to/code_factory/code_factory.py --once
+```
 
 ## How It Works
 
-A polling loop checks a GitHub repo for actionable work, then dispatches Claude Code to handle it. Every change goes through a **plan-first workflow** — Claude proposes a plan as a draft PR, waits for human review, and only implements after approval.
-
-```
-┌─────────────┐     ┌──────────────────┐     ┌────────────────┐
-│  run_loop.sh │────▶│ check_actionable │────▶│ git-contribute │
-│  (poll every │     │  (find work via  │     │  (claim, plan, │
-│   5 minutes) │     │   gh CLI)        │     │  implement, PR)│
-└─────────────┘     └──────────────────┘     └────────────────┘
-```
+A single Python script checks a GitHub repo for actionable work, then orchestrates Claude Code to handle it. Every change goes through a **plan-first workflow** — Claude proposes a plan as a draft PR, waits for human review, and only implements after approval.
 
 ### Lifecycle
 
@@ -52,54 +49,36 @@ Existing work is always finished before new work is started:
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI installed
 - [`gh` CLI](https://cli.github.com/) authenticated with repo permissions
 - Python 3
-- The `git-contribute` skill installed in Claude Code (see `skills/git-contribute/SKILL.md`)
 
 ## Usage
 
-### Check for actionable work (one-shot)
-
 ```bash
-# Current repo (run from inside a cloned repo)
-python3 check-actionable-issues/check_actionable.py
+# Continuous loop — polls every 5 minutes, dispatches work automatically
+python3 code_factory.py --repo owner/repo
 
-# Specific repo
-python3 check-actionable-issues/check_actionable.py owner/repo
-```
+# Single pass — find one item, process it, exit
+python3 code_factory.py --once --repo owner/repo
 
-Exit code `0` means work was found, `1` means nothing actionable.
-
-### Run the continuous loop
-
-```bash
-# Current repo
-./check-actionable-issues/run_loop.sh
-
-# Specific repo
-./check-actionable-issues/run_loop.sh owner/repo
-```
-
-This will:
-- Poll every **5 minutes** for actionable work
-- When work is found, launch `claude --dangerously-skip-permissions` to run the `git-contribute` skill
-- Sleep **5 seconds** between dispatches when work exists, **5 minutes** when idle
-- Automatically retry with exponential backoff if GitHub rate-limits a request
-
-### Run git-contribute directly
-
-```bash
-claude /git-contribute
+# Auto-detect repo from current directory
+python3 code_factory.py --once
 ```
 
 ## Project Structure
 
 ```
-check-actionable-issues/
-  check_actionable.py   # Queries GitHub for actionable issues/PRs
-  run_loop.sh           # Polling loop that dispatches git-contribute
-
+code_factory.py           # Orchestrator: poll, route, manage phases, invoke claude
+prompts/                  # Prompt templates for LLM-dependent phases
+  phase1_claim_and_plan.md
+  phase2_process_feedback.md
+  phase4_implement.md
+  phase6_process_review.md
+  phase6_apply_fixes.md
 skills/
   git-contribute/
-    SKILL.md            # Full skill definition (claim → plan → implement → merge)
+    SKILL.md              # Thin wrapper for Claude Code skill invocation
+    TROUBLESHOOTING.md    # Diagnostics and manual fix recipes
+tests/
+  test_code_factory.py    # Unit tests
 ```
 
 ## Labels
@@ -108,4 +87,5 @@ The workflow uses these GitHub labels (created automatically on first run):
 
 - `bot:plan-proposed` — draft PR with a plan awaiting human review
 - `bot:plan-accepted` — plan approved, ready for implementation
+- `bot:in-progress` — PR currently being processed
 - `bot:review-requested` — implementation complete, awaiting code review
