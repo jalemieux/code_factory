@@ -112,7 +112,7 @@ def check_unclaimed_issues(repo: str) -> list[dict]:
         linked_prs = gh_json(
             "pr", "list", "--repo", repo,
             "--search", f"#{issue['number']}",
-            "--state", "all",
+            "--state", "open",
             "--json", "number",
             "--jq", "length",
         )
