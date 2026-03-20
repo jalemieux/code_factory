@@ -6,10 +6,17 @@
 
 Automation that turns GitHub issues into merged PRs with human oversight, powered by [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
 
+## The Problem
+
+Most of the time, you already know what needs to change — the bug, the feature, the refactor. What you don't have is the hour to sit at a terminal and shepherd an AI through it. Code Factory moves the entire interaction to GitHub: describe the work in an issue, review an AI-generated plan on a draft PR, leave comments, and merge when you're satisfied. GitHub becomes the interface — no terminal session required.
+
+Issues in, merged PRs out, with you in the driver's seat the entire time.
+
 ## Quick Start
 
 ```bash
-# Continuous polling (runs until stopped)
+# Continuous polling (runs until stopped — best in a tmux/screen session)
+tmux new -s factory
 python3 code_factory.py --repo owner/repo
 
 # Single pass (process one item and exit)
@@ -66,7 +73,7 @@ python3 code_factory.py --once
 ## Project Structure
 
 ```
-code_factory.py           # Orchestrator: poll, route, manage phases, invoke claude
+code_factory.py           # Orchestrator: poll, route, manage phases, invoke Claude Code
 prompts/                  # Prompt templates for LLM-dependent phases
   phase1_claim_and_plan.md
   phase2_process_feedback.md
@@ -75,8 +82,9 @@ prompts/                  # Prompt templates for LLM-dependent phases
   phase6_apply_fixes.md
 skills/
   git-contribute/
-    SKILL.md              # Thin wrapper for Claude Code skill invocation
+    SKILL.md              # Claude Code skill for interactive invocation
     TROUBLESHOOTING.md    # Diagnostics and manual fix recipes
+docs/                     # Design specs and implementation plans
 tests/
   test_code_factory.py    # Unit tests
 ```
