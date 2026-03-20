@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -479,3 +480,78 @@ def phase6_process_review(repo: str, pr: dict) -> tuple[str, dict] | None:
 
     remove_in_progress(repo, num)
     return None
+
+
+PHASES: dict[str, callable] = {
+    "phase1_claim_and_plan": phase1_claim_and_plan,
+    "phase2_process_feedback": phase2_process_feedback,
+    "phase4_implement": phase4_implement,
+    "phase5_post_implementation": phase5_post_implementation,
+    "phase6_process_review": phase6_process_review,
+}
+
+
+def bootstrap_repo(repo: str) -> None:
+    """Ensure the repo is cloned and default branch is synced."""
+    try:
+        current_repo = gh("repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner")
+        if current_repo == repo:
+            default_branch = gh(
+                "repo", "view", "--repo", repo,
+                "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name",
+            )
+            git("checkout", default_branch)
+            git("pull", "--ff-only")
+            return
+    except RuntimeError:
+        pass
+    gh("repo", "clone", repo)
+    repo_name = repo.split("/")[-1]
+    os.chdir(repo_name)
+    log(f"Cloned and entered {repo}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Code Factory — autonomous GitHub contributions")
+    parser.add_argument("--repo", help="owner/repo (default: current repo)")
+    parser.add_argument("--once", action="store_true", help="single pass, then exit")
+    args = parser.parse_args()
+
+    repo = get_repo(args.repo)
+    log(f"Code Factory targeting: {repo}")
+    bootstrap_repo(repo)
+
+    while True:
+        log("Checking for actionable work...")
+        result = route(repo)
+
+        if result:
+            phase_name, ctx = result
+            log(f"Work found — starting {phase_name}")
+            try:
+                next_result = result
+                while next_result:
+                    phase_name, ctx = next_result
+                    phase_fn = PHASES[phase_name]
+                    next_result = phase_fn(**ctx)
+            except Exception as e:
+                log(f"Error in {phase_name}: {e}")
+                pr = ctx.get("pr")
+                if pr:
+                    try:
+                        remove_in_progress(repo, pr["number"])
+                    except Exception:
+                        pass
+        else:
+            log("No actionable work found.")
+
+        if args.once:
+            break
+
+        sleep_time = 5 if result else 300
+        log(f"Sleeping {sleep_time} seconds...")
+        time.sleep(sleep_time)
+
+
+if __name__ == "__main__":
+    main()

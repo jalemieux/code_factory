@@ -265,3 +265,42 @@ class TestPhase2(unittest.TestCase):
         )
         self.assertIsNone(result)
         mock_remove.assert_called_once_with("owner/repo", 5)
+
+
+class TestMain(unittest.TestCase):
+    @patch("code_factory.bootstrap_repo")
+    @patch("code_factory.time.sleep")
+    @patch("code_factory.route", return_value=None)
+    @patch("code_factory.get_repo", return_value="owner/repo")
+    def test_once_mode_exits_when_no_work(self, mock_repo, mock_route, mock_sleep, mock_bootstrap):
+        with patch("sys.argv", ["code_factory.py", "--once"]):
+            code_factory.main()
+        mock_route.assert_called_once_with("owner/repo")
+        mock_sleep.assert_not_called()
+
+    @patch("code_factory.bootstrap_repo")
+    @patch("code_factory.time.sleep")
+    @patch("code_factory.remove_in_progress")
+    @patch("code_factory.route")
+    @patch("code_factory.get_repo", return_value="owner/repo")
+    def test_once_mode_runs_phase_and_exits(self, mock_repo, mock_route, mock_remove, mock_sleep, mock_bootstrap):
+        phase_fn = MagicMock(return_value=None)
+        mock_route.return_value = ("test_phase", {"repo": "owner/repo", "pr": {"number": 1}})
+        with patch("sys.argv", ["code_factory.py", "--once"]):
+            with patch.dict(code_factory.PHASES, {"test_phase": phase_fn}):
+                code_factory.main()
+        phase_fn.assert_called_once()
+
+    @patch("code_factory.bootstrap_repo")
+    @patch("code_factory.time.sleep")
+    @patch("code_factory.remove_in_progress")
+    @patch("code_factory.route")
+    @patch("code_factory.get_repo", return_value="owner/repo")
+    def test_error_cleans_up_in_progress(self, mock_repo, mock_route, mock_remove, mock_sleep, mock_bootstrap):
+        def failing_phase(**ctx):
+            raise RuntimeError("boom")
+        mock_route.return_value = ("test_phase", {"repo": "owner/repo", "pr": {"number": 7}})
+        with patch("sys.argv", ["code_factory.py", "--once"]):
+            with patch.dict(code_factory.PHASES, {"test_phase": failing_phase}):
+                code_factory.main()
+        mock_remove.assert_called_once_with("owner/repo", 7)
