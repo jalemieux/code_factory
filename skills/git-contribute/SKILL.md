@@ -239,6 +239,10 @@ After all steps pass → **Phase 5**
    ```
 5. **Exit** — wait for re-review.
 
+## Troubleshooting
+
+When routing finds no work, a PR is stuck, or state looks wrong, consult [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for diagnostic flows, expected state at each phase, and manual fix recipes.
+
 ## Tips
 
 - Always re-read `CONTRIBUTING.md` before planning — conventions change.
