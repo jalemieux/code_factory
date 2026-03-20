@@ -102,7 +102,13 @@ Skip any issue where this returns > 0. If candidates remain → **Phase 1**
    ## Risks / Open Questions
    - {anything uncertain or worth flagging}
    ```
-6. Create draft PR:
+6. Ensure labels exist (first-time only — safe to repeat, **must run before creating the PR**):
+   ```bash
+   for label in "bot:plan-proposed" "bot:plan-accepted" "bot:review-requested"; do
+     gh label create "$label" --description "Managed by git-contribute" --color "0E8A16" --force 2>/dev/null
+   done
+   ```
+7. Create draft PR:
    ```bash
    slug=$(echo "{issue_title}" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '-' | head -c 40)
    git checkout -b bot/{issue_num}-${slug}
@@ -116,12 +122,6 @@ Skip any issue where this returns > 0. If candidates remain → **Phase 1**
      --label "bot:plan-proposed"
    ```
    The PR body MUST include `Closes #{issue_num}` to link the issue.
-7. Ensure labels exist (first-time only — safe to repeat):
-   ```bash
-   for label in "bot:plan-proposed" "bot:plan-accepted" "bot:review-requested"; do
-     gh label create "$label" --description "Managed by git-contribute" --color "0E8A16" --force 2>/dev/null
-   done
-   ```
 8. **Exit** — wait for feedback.
 
 ### Phase 2: Process Plan Feedback
