@@ -280,7 +280,7 @@ def phase1_claim_and_plan(repo: str, issue: dict) -> tuple[str, dict] | None:
 
     slug = slugify(title)
     branch = f"bot/{num}-{slug}"
-    default_branch = gh("repo", "view", "--repo", repo, "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name")
+    default_branch = gh("repo", "view", repo, "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name")
     git("checkout", default_branch)
     git("pull", "--ff-only")
     git("checkout", "-b", branch)
@@ -498,7 +498,7 @@ def bootstrap_repo(repo: str) -> None:
         current_repo = gh("repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner")
         if current_repo == repo:
             default_branch = gh(
-                "repo", "view", "--repo", repo,
+                "repo", "view", repo,
                 "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name",
             )
             git("checkout", default_branch)
