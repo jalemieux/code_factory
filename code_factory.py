@@ -516,6 +516,11 @@ def bootstrap_repo(repo: str) -> None:
     repo_name = repo.split("/")[-1]
     if os.path.isdir(repo_name):
         os.chdir(repo_name)
+        default_branch = gh(
+            "repo", "view", repo,
+            "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name",
+        )
+        git("checkout", default_branch)
         git("pull", "--ff-only")
         log(f"Entered existing clone: {repo}")
     else:
