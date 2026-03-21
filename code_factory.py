@@ -69,16 +69,28 @@ def ensure_labels(repo: str) -> None:
         )
 
 
+def add_label(repo: str, num: int, label: str) -> None:
+    gh("api", f"repos/{repo}/issues/{num}/labels", "-f", f"labels[]={label}")
+
+
+def remove_label(repo: str, num: int, label: str) -> None:
+    try:
+        gh("api", f"repos/{repo}/issues/{num}/labels/{label}", "-X", "DELETE")
+    except RuntimeError:
+        pass
+
+
 def add_in_progress(repo: str, num: int) -> None:
-    gh("pr", "edit", str(num), "--repo", repo, "--add-label", "bot:in-progress")
+    add_label(repo, num, "bot:in-progress")
 
 
 def remove_in_progress(repo: str, num: int) -> None:
-    gh("pr", "edit", str(num), "--repo", repo, "--remove-label", "bot:in-progress")
+    remove_label(repo, num, "bot:in-progress")
 
 
 def swap_label(repo: str, num: int, old: str, new: str) -> None:
-    gh("pr", "edit", str(num), "--repo", repo, "--remove-label", old, "--add-label", new)
+    remove_label(repo, num, old)
+    add_label(repo, num, new)
 
 
 def get_repo(repo: str | None = None) -> str:
@@ -308,13 +320,15 @@ def phase1_claim_and_plan(repo: str, issue: dict) -> tuple[str, dict] | None:
     )
     plan = claude(prompt)
 
-    gh(
+    pr_url = gh(
         "pr", "create", "--draft", "--repo", repo,
         "--title", title,
         "--body", plan,
-        "--label", "bot:plan-proposed",
     )
-    log(f"Phase 1 complete: draft PR created for issue #{num}")
+    # Extract PR number from URL and add label via API to avoid Projects Classic bug
+    pr_num = int(pr_url.rstrip("/").split("/")[-1])
+    add_label(repo, pr_num, "bot:plan-proposed")
+    log(f"Phase 1 complete: draft PR #{pr_num} created for issue #{num}")
     return None
 
 
