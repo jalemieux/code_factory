@@ -111,7 +111,10 @@ def claude(prompt: str) -> str:
         capture_output=True, text=True,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"claude failed: {result.stderr.strip()}")
+        stderr = result.stderr.strip()
+        stdout = result.stdout.strip()
+        detail = stderr or stdout or "(no output)"
+        raise RuntimeError(f"claude failed (exit {result.returncode}): {detail}")
     return result.stdout.strip()
 
 
@@ -123,7 +126,10 @@ def claude_interactive(prompt: str, workdir: str) -> str:
         cwd=workdir,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"claude failed: {result.stderr.strip()}")
+        stderr = result.stderr.strip()
+        stdout = result.stdout.strip()
+        detail = stderr or stdout or "(no output)"
+        raise RuntimeError(f"claude failed (exit {result.returncode}): {detail}")
     return result.stdout.strip()
 
 
