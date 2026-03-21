@@ -289,6 +289,11 @@ def phase1_claim_and_plan(repo: str, issue: dict) -> tuple[str, dict] | None:
     default_branch = gh("repo", "view", repo, "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name")
     git("checkout", default_branch)
     git("pull", "--ff-only")
+    # Clean up stale local branch from a previous failed run
+    try:
+        git("branch", "-D", branch)
+    except RuntimeError:
+        pass
     git("checkout", "-b", branch)
     git("commit", "--allow-empty", "-m", f"plan: {title} (#{num})")
     git("push", "-u", "origin", branch)
