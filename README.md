@@ -35,10 +35,28 @@ A single Python script checks a GitHub repo for actionable work, then orchestrat
 
 1. **Claim** — picks an unassigned issue and self-assigns
 2. **Plan** — creates a draft PR with an implementation plan
-3. **Review** — waits for human feedback on the plan
+3. **Review** — waits for human feedback on the plan (see [Reviewing Plans](#reviewing-plans))
 4. **Implement** — writes the code using TDD after plan approval
 5. **Verify** — runs tests and CI checks
-6. **Merge** — after human code review approval
+6. **Code Review** — waits for human code review (see [Reviewing Code](#reviewing-code))
+7. **Merge** — after human code review approval
+
+### Reviewing Plans
+
+When the bot creates a draft PR with a plan, **leave a comment on the PR** to provide feedback. Do **not** use GitHub's "Approve" review button — the bot reads PR comments, not review approvals.
+
+| What you want | What to comment |
+|---------------|-----------------|
+| Approve the plan | `LGTM`, `looks good`, `ship it`, `approved` |
+| Approve with tweaks | `Looks good, but also add tests for X` |
+| Request major changes | `This approach won't work because X. Instead, try Y.` |
+| Ask a question | `What about edge case X?` |
+
+The bot will classify your comment and either start implementing, revise the plan, or reply with clarification.
+
+### Reviewing Code
+
+After implementation, the bot marks the PR ready for review and adds the `bot:review-requested` label. At this stage, use GitHub's normal code review workflow — leave review comments, request changes, or approve. The bot will address review feedback or merge after approval.
 
 ### Priority Order
 
