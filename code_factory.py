@@ -286,7 +286,8 @@ def phase1_claim_and_plan(repo: str, issue: dict) -> tuple[str, dict] | None:
     title = issue["title"]
     log(f"Phase 1: claiming issue #{num} — {title}")
 
-    gh("issue", "edit", str(num), "--repo", repo, "--add-assignee", "@me")
+    username = gh("api", "user", "-q", ".login")
+    gh("api", f"repos/{repo}/issues/{num}/assignees", "-f", f"assignees[]={username}")
     ensure_labels(repo)
 
     issue_body = gh("issue", "view", str(num), "--repo", repo, "--json", "body", "-q", ".body")
