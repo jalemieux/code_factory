@@ -403,6 +403,7 @@ def phase4_implement(repo: str, pr: dict) -> tuple[str, dict] | None:
     branch = get_pr_branch(repo, num)
 
     git("fetch", "origin", branch)
+    git("clean", "-fd")
     git("checkout", branch)
     git("pull", "--ff-only", "origin", branch)
 
