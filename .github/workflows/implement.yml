@@ -1,0 +1,55 @@
+name: Implement
+
+on:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  implement-plan:
+    if: github.event.label.name == 'bot:plan-accepted'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          allowed_tools: "bash,computer,mcp"
+          prompt: |
+            You are implementing an approved plan for PR #${{ github.event.pull_request.number }} in ${{ github.repository }}.
+
+            ## Branch: ${{ github.head_ref }}
+
+            ## Your Task
+
+            1. Read the PR body — it contains the approved implementation plan.
+            2. Read repo conventions — check for CONTRIBUTING.md, CLAUDE.md, AGENTS.md, or similar files in the repo root. Follow their instructions.
+            3. Implement the plan using TDD:
+               - For each component in the plan, write the failing test first
+               - Run it to confirm it fails
+               - Write the minimal implementation to make it pass
+               - Run it to confirm it passes
+            4. Run the full test suite. Fix any failures.
+            5. Commit and push your changes:
+               ```bash
+               git push origin ${{ github.head_ref }}
+               ```
+            6. Mark the PR as ready for review:
+               ```bash
+               gh pr ready ${{ github.event.pull_request.number }}
+               ```
+
+            Important:
+            - Follow the repo's existing patterns and test framework.
+            - Do not introduce new dependencies unless the plan explicitly calls for them.
+            - Do not force-push — it destroys review context.
+            - Every commit should leave the repo in a working state.
+            - Make focused commits with clear messages.

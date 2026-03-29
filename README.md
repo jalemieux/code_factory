@@ -14,32 +14,26 @@ Issues in, merged PRs out, with you in the driver's seat the entire time.
 
 ## Quick Start
 
-```bash
-# Continuous polling (runs until stopped — best in a tmux/screen session)
-tmux new -s factory
-python3 code_factory.py --repo owner/repo
-
-# Single pass (process one item and exit)
-python3 code_factory.py --once --repo owner/repo
-
-# Auto-detect repo from current directory
-cd /path/to/your-repo
-python3 /path/to/code_factory/code_factory.py --once
-```
+1. Copy `.github/workflows/plan.yml` and `.github/workflows/implement.yml` into your repository
+2. Add repository secrets ([see Setup](#setup))
+3. Create an issue — the bot opens a draft PR with an implementation plan
+4. Comment on the PR to give feedback or approve
+5. On approval, the bot implements the plan and marks the PR ready for review
+6. You review and merge
 
 ## How It Works
 
-A single Python script checks a GitHub repo for actionable work, then orchestrates Claude Code to handle it. Every change goes through a **plan-first workflow** — Claude proposes a plan as a draft PR, waits for human review, and only implements after approval.
+Two GitHub Actions workflows respond to events in your repo. No polling, no local process, no terminal.
 
 ### Lifecycle
 
-1. **Claim** — picks an unassigned issue and self-assigns
-2. **Plan** — creates a draft PR with an implementation plan
-3. **Review** — waits for human feedback on the plan (see [Reviewing Plans](#reviewing-plans))
-4. **Implement** — writes the code using TDD after plan approval
-5. **Verify** — runs tests and CI checks
-6. **Code Review** — waits for human code review (see [Reviewing Code](#reviewing-code))
-7. **Merge** — after human code review approval
+1. **Issue opened** — Claude reads the issue, explores the codebase, and opens a draft PR with a structured implementation plan
+2. **You review the plan** — leave a comment on the PR ([see below](#reviewing-plans))
+3. **Feedback loop** — Claude classifies your comment: if it's feedback, the plan is revised; if it's approval, implementation begins
+4. **Implementation** — Claude implements the plan using TDD, pushes code, and marks the PR ready for review
+5. **You merge** — review the code and merge at your discretion
+
+The PR is the single conversation thread. All interaction happens there.
 
 ### Reviewing Plans
 
@@ -56,62 +50,65 @@ The bot will classify your comment and either start implementing, revise the pla
 
 ### Reviewing Code
 
-After implementation, the bot marks the PR ready for review and adds the `bot:review-requested` label. At this stage, use GitHub's normal code review workflow — leave review comments, request changes, or approve. The bot will address review feedback or merge after approval.
+After implementation, the bot marks the PR ready for review. Use GitHub's normal code review workflow — leave review comments, request changes, or approve. You merge when satisfied.
 
-### Priority Order
+## Setup
 
-Existing work is always finished before new work is started:
+### 1. Add Repository Secrets
 
-| Priority | What | Action |
-|----------|------|--------|
-| 1 | PRs with code review feedback | Address reviewer comments |
-| 2 | PRs with plan feedback | Incorporate feedback or proceed |
-| 3 | Accepted plans | Implement the approved plan |
-| 4 | Unclaimed issues | Claim and propose a plan |
+Go to **Settings > Secrets and variables > Actions** and add:
 
-## Prerequisites
+| Secret | Purpose |
+|--------|---------|
+| `ANTHROPIC_API_KEY` | Claude API access |
+| `PAT_TOKEN` | Personal access token for triggering workflows (see below) |
 
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI installed
-- [`gh` CLI](https://cli.github.com/) authenticated with repo permissions
-- Python 3
+### 2. Create the PAT Token
 
-## Usage
+GitHub's built-in `GITHUB_TOKEN` prevents workflows from triggering other workflows (anti-loop protection). A PAT bypasses this so that approving a plan can trigger the implement workflow.
+
+Create a [fine-grained personal access token](https://github.com/settings/tokens?type=beta) with these repository permissions:
+- **Contents**: Read and write
+- **Pull requests**: Read and write
+- **Issues**: Read and write
+
+Alternatively, use a GitHub App installation token with the same permissions.
+
+### 3. Copy Workflow Files
 
 ```bash
-# Continuous loop — polls every 5 minutes, dispatches work automatically
-python3 code_factory.py --repo owner/repo
-
-# Single pass — find one item, process it, exit
-python3 code_factory.py --once --repo owner/repo
-
-# Auto-detect repo from current directory
-python3 code_factory.py --once
+# From your target repository
+mkdir -p .github/workflows
+cp path/to/code_factory/.github/workflows/plan.yml .github/workflows/
+cp path/to/code_factory/.github/workflows/implement.yml .github/workflows/
+git add .github/workflows
+git commit -m "ci: add Code Factory workflows"
+git push
 ```
+
+### 4. Create Labels (optional)
+
+Claude will create labels automatically if missing, but you can pre-create:
+
+- `bot:plan-accepted` — triggers the implement workflow when a plan is approved
 
 ## Project Structure
 
 ```
-code_factory.py           # Orchestrator: poll, route, manage phases, invoke Claude Code
-prompts/                  # Prompt templates for LLM-dependent phases
-  phase1_claim_and_plan.md
-  phase2_process_feedback.md
-  phase4_implement.md
-  phase6_process_review.md
-  phase6_apply_fixes.md
-skills/
-  git-contribute/
-    SKILL.md              # Claude Code skill for interactive invocation
-    TROUBLESHOOTING.md    # Diagnostics and manual fix recipes
-docs/                     # Design specs and implementation plans
+.github/workflows/
+  plan.yml                # Issue opened → draft PR with plan; PR comments → feedback loop
+  implement.yml           # Plan approved → TDD implementation, push, mark ready
+code_factory.py           # Legacy local script (polling-based alternative)
+prompts/                  # Prompt templates (used by local script)
 tests/
   test_code_factory.py    # Unit tests
 ```
 
-## Labels
+## Legacy: Local Script
 
-The workflow uses these GitHub labels (created automatically on first run):
+An older polling-based approach is also available via `code_factory.py`. It requires the Claude Code CLI, `gh` CLI, and Python 3 installed locally.
 
-- `bot:plan-proposed` — draft PR with a plan awaiting human review
-- `bot:plan-accepted` — plan approved, ready for implementation
-- `bot:in-progress` — PR currently being processed
-- `bot:review-requested` — implementation complete, awaiting code review
+```bash
+python3 code_factory.py --repo owner/repo       # Continuous polling
+python3 code_factory.py --once --repo owner/repo # Single pass
+```

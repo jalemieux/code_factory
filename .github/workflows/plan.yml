@@ -1,0 +1,111 @@
+name: Plan
+
+on:
+  issues:
+    types: [opened]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write
+
+jobs:
+  propose-plan:
+    if: github.event_name == 'issues' && github.event.action == 'opened'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            You are proposing an implementation plan for a GitHub issue.
+
+            ## Issue #${{ github.event.issue.number }}: ${{ github.event.issue.title }}
+
+            ${{ github.event.issue.body }}
+
+            ## Your Task
+
+            1. Read the issue above carefully.
+            2. Read repo conventions — check for CONTRIBUTING.md, CLAUDE.md, AGENTS.md, or similar files in the repo root. Follow their instructions.
+            3. Explore the codebase to understand the relevant code, architecture, and test patterns.
+            4. Create a branch named `bot/${{ github.event.issue.number }}-<short-slug>` (derive slug from the issue title, lowercase, hyphens, max 40 chars).
+            5. Open a **draft PR** against the default branch with a structured implementation plan as the body.
+
+            The PR body MUST use this structure:
+
+            ## Problem
+            What the issue asks for, in your own words.
+
+            ## Approach
+            High-level strategy — what changes, why this approach.
+
+            ## Planned Changes
+            - `file/path`: what changes and why
+            - ...
+
+            ## Test Strategy
+            How the implementation will be verified.
+
+            ## Risks / Open Questions
+            Anything uncertain or worth flagging.
+
+            ---
+            Closes #${{ github.event.issue.number }}
+
+            Keep the plan concise — bullet points, not essays. Reviewers skim.
+
+  assess-feedback:
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      github.event.issue.pull_request.url &&
+      github.event.comment.user.type != 'Bot' &&
+      github.event.sender.type != 'Bot'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            You are assessing human feedback on a proposed implementation plan.
+
+            ## PR #${{ github.event.issue.number }}
+
+            A human just left a comment on this PR. Read the PR body (the current plan) and all comments on the PR.
+
+            ## Your Task
+
+            1. Read the PR body (the current plan) and all PR comments.
+            2. Classify the latest comment from @${{ github.event.comment.user.login }}:
+
+               - **Approval**: Explicit approval words like "LGTM", "looks good", "approved", "ship it" with no requested changes.
+               - **Feedback**: Requested changes, suggestions, or concerns about the plan.
+               - **Noise**: Unrelated chatter, reactions, or comments not about the plan.
+
+            3. Take the appropriate action:
+
+               - **If approval**: Add the label `bot:plan-accepted` to this PR. You MUST use the PAT token for this — run:
+                 ```bash
+                 gh pr edit ${{ github.event.issue.number }} --add-label "bot:plan-accepted"
+                 ```
+                 with `GH_TOKEN` set to the PAT token. This is required so the label event triggers the implement workflow.
+
+               - **If feedback**: Revise the plan in the PR body to address the feedback. Reply with a comment acknowledging what you changed.
+
+               - **If noise**: Do nothing.
+
+            Important:
+            - Treat silence or ambiguity as NOT approval. Only explicit approval words trigger the approval action.
+            - When revising, preserve the plan structure (Problem, Approach, Planned Changes, Test Strategy, Risks).
+            - Keep the `Closes #N` line in the PR body.
+          allowed_tools: "bash,computer,mcp"
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
