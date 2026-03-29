@@ -56,11 +56,17 @@ After implementation, the bot marks the PR ready for review. Use GitHub's normal
 
 ### 1. Add Repository Secrets
 
-Go to **Settings > Secrets and variables > Actions** and add:
+Generate an OAuth token tied to your Claude Code subscription (no separate API key needed):
+
+```bash
+claude setup-token
+```
+
+Then go to **Settings > Secrets and variables > Actions** and add:
 
 | Secret | Purpose |
 |--------|---------|
-| `ANTHROPIC_API_KEY` | Claude API access |
+| `CLAUDE_CODE_OAUTH_TOKEN` | OAuth token from `claude setup-token` (uses your Claude Code subscription) |
 | `PAT_TOKEN` | Personal access token for triggering workflows (see below) |
 
 ### 2. Create the PAT Token
