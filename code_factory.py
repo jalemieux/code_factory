@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -18,6 +19,16 @@ PROMPTS_DIR = Path(__file__).parent / "prompts"
 
 def log(msg: str) -> None:
     print(f"{datetime.now():%Y-%m-%d %H:%M:%S} — {msg}", file=sys.stderr)
+
+
+def _fmt_argv(prog: str, args: tuple[str, ...]) -> str:
+    parts = [prog]
+    for a in args:
+        if "\n" in a or len(a) > 120:
+            parts.append(f"<{len(a)}-char arg>")
+        else:
+            parts.append(shlex.quote(a))
+    return " ".join(parts)
 
 
 def gh(*args: str) -> str:
@@ -33,7 +44,10 @@ def gh(*args: str) -> str:
             log(f"Rate limited, retrying in {wait}s...")
             time.sleep(wait)
             continue
-        raise RuntimeError(f"gh {' '.join(args)} failed: {result.stderr.strip()}")
+        detail = result.stderr.strip() or result.stdout.strip() or "<no output>"
+        raise RuntimeError(
+            f"{_fmt_argv('gh', args)} (exit {result.returncode}): {detail}"
+        )
     return ""
 
 
@@ -45,12 +59,36 @@ def git(*args: str) -> str:
     """Run a git command, raise on failure."""
     result = subprocess.run(["git", *args], capture_output=True, text=True)
     if result.returncode != 0:
-        raise RuntimeError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
+        detail = result.stderr.strip() or result.stdout.strip() or "<no output>"
+        raise RuntimeError(
+            f"{_fmt_argv('git', args)} (exit {result.returncode}): {detail}"
+        )
     return result.stdout.strip()
 
 
 def slugify(title: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", title.lower())[:40].strip("-")
+
+
+def _strip_outer_fence(text: str) -> str:
+    """If `text` is fully wrapped in a markdown code fence, remove it."""
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    lines = stripped.splitlines()
+    if len(lines) < 2 or not lines[-1].strip().startswith("```"):
+        return stripped
+    inner = "\n".join(lines[1:-1]).strip()
+    # Only strip if there's no other fence inside — otherwise we'd corrupt nested code blocks
+    if "```" in inner:
+        return stripped
+    return inner
+
+
+def _issue_num_from_branch(branch: str) -> int | None:
+    """Branches created by phase1 are `bot/<num>-<slug>` — extract <num>."""
+    m = re.match(r"^bot/(\d+)-", branch or "")
+    return int(m.group(1)) if m else None
 
 
 def ensure_labels(repo: str) -> None:
@@ -179,22 +217,38 @@ def check_review_requested(repo: str) -> list[dict]:
 
 
 def check_plan_feedback(repo: str) -> list[dict]:
-    """Priority 2: Own draft PRs with plan feedback."""
+    """Priority 2: Own draft PRs with plan feedback (on the PR or the linked issue)."""
     prs = gh_json(
         "pr", "list", "--repo", repo,
         "--author", "@me",
         "--draft",
         "--label", "bot:plan-proposed",
-        "--json", "number,title",
+        "--json", "number,title,headRefName",
     )
     actionable = []
     for pr in prs:
-        comment_count = gh_json(
+        pr_count = gh_json(
             "pr", "view", str(pr["number"]), "--repo", repo,
             "--json", "comments",
             "--jq", ".comments | length",
         )
-        if comment_count and comment_count > 0:
+        pr_count = pr_count if isinstance(pr_count, int) else 0
+
+        issue_num = _issue_num_from_branch(pr.get("headRefName", ""))
+        issue_count = 0
+        if issue_num:
+            try:
+                issue_count = gh_json(
+                    "issue", "view", str(issue_num), "--repo", repo,
+                    "--json", "comments",
+                    "--jq", ".comments | length",
+                )
+                issue_count = issue_count if isinstance(issue_count, int) else 0
+            except RuntimeError:
+                issue_count = 0
+
+        if pr_count + issue_count > 0:
+            pr["issue_number"] = issue_num
             actionable.append(pr)
     return actionable
 
@@ -320,11 +374,15 @@ def phase1_claim_and_plan(repo: str, issue: dict) -> tuple[str, dict] | None:
         recent_prs=recent_prs,
     )
     plan = claude(prompt)
+    plan_body = _strip_outer_fence(plan)
+    # Always append `Closes #N` on its own line, outside any fence, so GitHub
+    # links the PR to the issue (the LLM often buries it inside a code block).
+    plan_body = f"{plan_body}\n\nCloses #{num}"
 
     pr_url = gh(
         "pr", "create", "--draft", "--repo", repo,
         "--title", title,
-        "--body", plan,
+        "--body", plan_body,
     )
     # Extract PR number from URL and add label via API to avoid Projects Classic bug
     pr_num = int(pr_url.rstrip("/").split("/")[-1])
@@ -339,12 +397,29 @@ def phase2_process_feedback(repo: str, pr: dict) -> tuple[str, dict] | None:
     log(f"Phase 2: processing feedback on PR #{num}")
     add_in_progress(repo, num)
 
-    comments = gh(
+    pr_comments = gh(
         "pr", "view", str(num), "--repo", repo,
         "--json", "comments",
         "--jq", r'.comments[] | "\(.author.login) (\(.createdAt)): \(.body)"',
     )
     plan_body = gh("pr", "view", str(num), "--repo", repo, "--json", "body", "-q", ".body")
+
+    issue_num = pr.get("issue_number") or _issue_num_from_branch(get_pr_branch(repo, num))
+    parts = []
+    if pr_comments:
+        parts.append(f"### Comments on PR #{num}\n{pr_comments}")
+    if issue_num:
+        try:
+            issue_comments = gh(
+                "issue", "view", str(issue_num), "--repo", repo,
+                "--json", "comments",
+                "--jq", r'.comments[] | "\(.author.login) (\(.createdAt)): \(.body)"',
+            )
+            if issue_comments:
+                parts.append(f"### Comments on linked issue #{issue_num}\n{issue_comments}")
+        except RuntimeError:
+            pass
+    comments = "\n\n".join(parts) or "(no comments found)"
 
     prompt = load_prompt(
         "phase2_process_feedback",
