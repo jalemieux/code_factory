@@ -10,11 +10,13 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
+AGENT_CLI = "claude"
 
 
 def log(msg: str) -> None:
@@ -163,33 +165,51 @@ def load_prompt(phase: str, **kwargs: str) -> str:
     return template.format(**kwargs)
 
 
-def claude(prompt: str) -> str:
-    """Run claude CLI for reasoning tasks. Output-only, no tool access."""
+def _run_agent_command(command: list[str], *, cwd: str | None = None) -> str:
     result = subprocess.run(
-        ["claude", "-p", prompt, "--print"],
-        capture_output=True, text=True,
+        command,
+        capture_output=True,
+        text=True,
+        cwd=cwd,
     )
     if result.returncode != 0:
         stderr = result.stderr.strip()
         stdout = result.stdout.strip()
         detail = stderr or stdout or "(no output)"
-        raise RuntimeError(f"claude failed (exit {result.returncode}): {detail}")
+        raise RuntimeError(f"{command[0]} failed (exit {result.returncode}): {detail}")
     return result.stdout.strip()
 
 
-def claude_interactive(prompt: str, workdir: str) -> str:
-    """Run claude with full tool access for implementation work."""
-    result = subprocess.run(
+def _codex(prompt: str, *, workdir: str | None = None, interactive: bool = False) -> str:
+    with tempfile.NamedTemporaryFile(mode="r+", encoding="utf-8") as tmp:
+        command = ["codex", "exec", "-o", tmp.name]
+        if interactive:
+            command.append("--dangerously-bypass-approvals-and-sandbox")
+        else:
+            command.extend(["--sandbox", "read-only"])
+        if workdir:
+            command.extend(["-C", workdir])
+        command.append(prompt)
+        _run_agent_command(command, cwd=workdir)
+        tmp.seek(0)
+        return tmp.read().strip()
+
+
+def llm_reason(prompt: str) -> str:
+    """Run the configured agent CLI for reasoning tasks."""
+    if AGENT_CLI == "codex":
+        return _codex(prompt)
+    return _run_agent_command(["claude", "-p", prompt, "--print"])
+
+
+def llm_interactive(prompt: str, workdir: str) -> str:
+    """Run the configured agent CLI with tool access for implementation work."""
+    if AGENT_CLI == "codex":
+        return _codex(prompt, workdir=workdir, interactive=True)
+    return _run_agent_command(
         ["claude", "--dangerously-skip-permissions", "-p", prompt, "--print"],
-        capture_output=True, text=True,
         cwd=workdir,
     )
-    if result.returncode != 0:
-        stderr = result.stderr.strip()
-        stdout = result.stdout.strip()
-        detail = stderr or stdout or "(no output)"
-        raise RuntimeError(f"claude failed (exit {result.returncode}): {detail}")
-    return result.stdout.strip()
 
 
 def get_in_progress_prs(repo: str) -> set[int]:
@@ -404,7 +424,7 @@ def phase1_claim_and_plan(repo: str, issue: dict) -> tuple[str, dict] | None:
         conventions=conventions,
         recent_prs=recent_prs,
     )
-    plan = claude(prompt)
+    plan = llm_reason(prompt)
     plan_body = _strip_outer_fence(plan)
     # Always append `Closes #N` on its own line, outside any fence, so GitHub
     # links the PR to the issue (the LLM often buries it inside a code block).
@@ -459,11 +479,11 @@ def phase2_process_feedback(repo: str, pr: dict) -> tuple[str, dict] | None:
         plan_body=plan_body,
         comments=comments,
     )
-    result = claude(prompt)
+    result = llm_reason(prompt)
     parsed = parse_claude_json(result)
 
     if not parsed or "action" not in parsed:
-        log(f"Phase 2: malformed response from claude, will retry next iteration")
+        log(f"Phase 2: malformed response from {AGENT_CLI}, will retry next iteration")
         remove_in_progress(repo, num)
         return None
 
@@ -521,7 +541,7 @@ def phase4_implement(repo: str, pr: dict) -> tuple[str, dict] | None:
         branch=branch,
     )
     workdir = git("rev-parse", "--show-toplevel")
-    claude_interactive(prompt, workdir)
+    llm_interactive(prompt, workdir)
 
     log(f"Phase 4 complete: implementation done for PR #{num}")
     return ("phase5_post_implementation", {"repo": repo, "pr": pr})
@@ -564,11 +584,11 @@ def phase6_process_review(repo: str, pr: dict) -> tuple[str, dict] | None:
         pr_title=pr["title"],
         reviews=reviews,
     )
-    result = claude(prompt)
+    result = llm_reason(prompt)
     parsed = parse_claude_json(result)
 
     if not parsed or "action" not in parsed:
-        log(f"Phase 6: malformed response from claude, will retry next iteration")
+        log(f"Phase 6: malformed response from {AGENT_CLI}, will retry next iteration")
         remove_in_progress(repo, num)
         return None
 
@@ -594,7 +614,7 @@ def phase6_process_review(repo: str, pr: dict) -> tuple[str, dict] | None:
             branch=branch,
         )
         workdir = git("rev-parse", "--show-toplevel")
-        claude_interactive(fix_prompt, workdir)
+        llm_interactive(fix_prompt, workdir)
 
         review_data = json.loads(reviews)
         reviewers = {r["author"]["login"] for r in review_data.get("reviews", []) if r.get("author")}
@@ -658,12 +678,18 @@ def bootstrap_repo(repo: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Code Factory — autonomous GitHub contributions")
+    parser.add_argument("agent", nargs="?", choices=("claude", "codex"), help="agent CLI to use")
+    parser.add_argument("--agent", dest="agent_flag", choices=("claude", "codex"), help="agent CLI to use")
     parser.add_argument("--repo", help="owner/repo (default: current repo)")
     parser.add_argument("--once", action="store_true", help="single pass, then exit")
     args = parser.parse_args()
+    agent = args.agent_flag or args.agent or "claude"
+
+    global AGENT_CLI
+    AGENT_CLI = agent
 
     repo = get_repo(args.repo)
-    log(f"Code Factory targeting: {repo}")
+    log(f"Code Factory targeting: {repo} (agent: {AGENT_CLI})")
     bootstrap_repo(repo)
 
     while True:

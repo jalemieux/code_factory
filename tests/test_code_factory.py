@@ -127,7 +127,7 @@ class TestCheckUnclaimed(unittest.TestCase):
     def test_skips_issues_with_open_prs(self, mock_gh_json):
         mock_gh_json.side_effect = [
             [{"number": 1, "title": "Bug", "labels": [], "assignees": []}],
-            1,
+            [{"headRefName": "bot/1-bug"}],
         ]
         result = code_factory.check_unclaimed_issues("owner/repo")
         self.assertEqual(result, [])
@@ -136,7 +136,7 @@ class TestCheckUnclaimed(unittest.TestCase):
     def test_returns_unassigned_issue_with_no_prs(self, mock_gh_json):
         mock_gh_json.side_effect = [
             [{"number": 1, "title": "Bug", "labels": [], "assignees": []}],
-            0,
+            [],
         ]
         result = code_factory.check_unclaimed_issues("owner/repo")
         self.assertEqual(result, [{"number": 1, "title": "Bug", "labels": [], "assignees": []}])
@@ -227,44 +227,97 @@ class TestPhase5(unittest.TestCase):
 
 
 class TestPhase2(unittest.TestCase):
-    @patch("code_factory.claude")
+    @patch("code_factory.llm_reason")
     @patch("code_factory.gh")
     @patch("code_factory.swap_label")
     @patch("code_factory.add_in_progress")
-    def test_approve_chains_to_phase4(self, mock_add, mock_swap, mock_gh, mock_claude):
+    def test_approve_chains_to_phase4(self, mock_add, mock_swap, mock_gh, mock_llm):
         mock_gh.return_value = "user1 (2026-03-20): LGTM"
-        mock_claude.return_value = '{"action": "approve", "summary": "approved"}'
+        mock_llm.return_value = '{"action": "approve", "summary": "approved"}'
         result = code_factory.phase2_process_feedback(
             repo="owner/repo", pr={"number": 5, "title": "Fix"}
         )
         self.assertEqual(result[0], "phase4_implement")
         mock_swap.assert_called_once_with("owner/repo", 5, "bot:plan-proposed", "bot:plan-accepted")
 
-    @patch("code_factory.claude")
+    @patch("code_factory.llm_reason")
     @patch("code_factory.gh")
     @patch("code_factory.remove_in_progress")
     @patch("code_factory.add_in_progress")
-    def test_noop_returns_none(self, mock_add, mock_remove, mock_gh, mock_claude):
+    def test_noop_returns_none(self, mock_add, mock_remove, mock_gh, mock_llm):
         mock_gh.return_value = ""
-        mock_claude.return_value = '{"action": "noop", "summary": "no feedback"}'
+        mock_llm.return_value = '{"action": "noop", "summary": "no feedback"}'
         result = code_factory.phase2_process_feedback(
             repo="owner/repo", pr={"number": 5, "title": "Fix"}
         )
         self.assertIsNone(result)
         mock_remove.assert_called_once_with("owner/repo", 5)
 
-    @patch("code_factory.claude")
+    @patch("code_factory.llm_reason")
     @patch("code_factory.gh")
     @patch("code_factory.remove_in_progress")
     @patch("code_factory.add_in_progress")
-    def test_malformed_json_returns_none(self, mock_add, mock_remove, mock_gh, mock_claude):
+    def test_malformed_json_returns_none(self, mock_add, mock_remove, mock_gh, mock_llm):
         mock_gh.return_value = ""
-        mock_claude.return_value = "not json at all"
+        mock_llm.return_value = "not json at all"
         result = code_factory.phase2_process_feedback(
             repo="owner/repo", pr={"number": 5, "title": "Fix"}
         )
         self.assertIsNone(result)
         mock_remove.assert_called_once_with("owner/repo", 5)
+
+
+class TestAgentSelection(unittest.TestCase):
+    @patch("code_factory._run_agent_command")
+    def test_llm_reason_uses_claude_by_default(self, mock_run):
+        original = code_factory.AGENT_CLI
+        code_factory.AGENT_CLI = "claude"
+        mock_run.return_value = "ok"
+        try:
+            result = code_factory.llm_reason("prompt")
+        finally:
+            code_factory.AGENT_CLI = original
+        self.assertEqual(result, "ok")
+        mock_run.assert_called_once_with(["claude", "-p", "prompt", "--print"])
+
+    @patch("code_factory._codex")
+    def test_llm_reason_uses_codex_when_selected(self, mock_codex):
+        original = code_factory.AGENT_CLI
+        code_factory.AGENT_CLI = "codex"
+        mock_codex.return_value = "ok"
+        try:
+            result = code_factory.llm_reason("prompt")
+        finally:
+            code_factory.AGENT_CLI = original
+        self.assertEqual(result, "ok")
+        mock_codex.assert_called_once_with("prompt")
+
+    @patch("code_factory._run_agent_command")
+    def test_llm_interactive_uses_claude(self, mock_run):
+        original = code_factory.AGENT_CLI
+        code_factory.AGENT_CLI = "claude"
+        mock_run.return_value = "ok"
+        try:
+            result = code_factory.llm_interactive("prompt", "/tmp/repo")
+        finally:
+            code_factory.AGENT_CLI = original
+        self.assertEqual(result, "ok")
+        mock_run.assert_called_once_with(
+            ["claude", "--dangerously-skip-permissions", "-p", "prompt", "--print"],
+            cwd="/tmp/repo",
+        )
+
+    @patch("code_factory._codex")
+    def test_llm_interactive_uses_codex(self, mock_codex):
+        original = code_factory.AGENT_CLI
+        code_factory.AGENT_CLI = "codex"
+        mock_codex.return_value = "ok"
+        try:
+            result = code_factory.llm_interactive("prompt", "/tmp/repo")
+        finally:
+            code_factory.AGENT_CLI = original
+        self.assertEqual(result, "ok")
+        mock_codex.assert_called_once_with("prompt", workdir="/tmp/repo", interactive=True)
 
 
 class TestMain(unittest.TestCase):
@@ -277,6 +330,18 @@ class TestMain(unittest.TestCase):
             code_factory.main()
         mock_route.assert_called_once_with("owner/repo")
         mock_sleep.assert_not_called()
+
+    @patch("code_factory.bootstrap_repo")
+    @patch("code_factory.route", return_value=None)
+    @patch("code_factory.get_repo", return_value="owner/repo")
+    def test_agent_positional_argument_selects_codex(self, mock_repo, mock_route, mock_bootstrap):
+        original = code_factory.AGENT_CLI
+        try:
+            with patch("sys.argv", ["code_factory.py", "codex", "--once"]):
+                code_factory.main()
+            self.assertEqual(code_factory.AGENT_CLI, "codex")
+        finally:
+            code_factory.AGENT_CLI = original
 
     @patch("code_factory.bootstrap_repo")
     @patch("code_factory.time.sleep")
