@@ -226,11 +226,16 @@ def check_review_requested(repo: str) -> list[dict]:
 
 
 def check_plan_feedback(repo: str) -> list[dict]:
-    """Priority 2: Own draft PRs with plan feedback (on the PR or the linked issue)."""
+    """Priority 2: Own plan PRs with feedback (on the PR or the linked issue).
+
+    The `bot:plan-proposed` label is the source of truth — we don't also gate
+    on `--draft`, because a prior partial run or a manual "ready for review"
+    click can flip draft state without changing the label, which would
+    otherwise strand the PR with unprocessed feedback.
+    """
     prs = gh_json(
         "pr", "list", "--repo", repo,
         "--author", "@me",
-        "--draft",
         "--label", "bot:plan-proposed",
         "--json", "number,title,headRefName",
     )
