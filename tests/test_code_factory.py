@@ -114,6 +114,44 @@ class TestCheckReviewRequested(unittest.TestCase):
         self.assertEqual(result, [])
 
 
+class TestCheckPlanFeedback(unittest.TestCase):
+    @patch("code_factory.get_bot_login", return_value="bot-user")
+    @patch("code_factory.gh_json")
+    def test_returns_pr_when_human_comment_has_no_marker(self, mock_gh_json, mock_login):
+        mock_gh_json.side_effect = [
+            [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix"}],
+            [{"author": {"login": "reviewer"}, "createdAt": "2026-05-05T20:00:00Z", "body": "please revise"}],
+            [],
+        ]
+        result = code_factory.check_plan_feedback("owner/repo")
+        self.assertEqual(result, [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix", "issue_number": 42}])
+
+    @patch("code_factory.get_bot_login", return_value="bot-user")
+    @patch("code_factory.gh_json")
+    def test_skips_pr_when_marker_is_newer_than_human_comment(self, mock_gh_json, mock_login):
+        mock_gh_json.side_effect = [
+            [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix"}],
+            [
+                {"author": {"login": "reviewer"}, "createdAt": "2026-05-05T20:00:00Z", "body": "please revise"},
+                {"author": {"login": "bot-user"}, "createdAt": "2026-05-05T20:05:00Z", "body": code_factory.PHASE2_MARKER},
+            ],
+            [],
+        ]
+        result = code_factory.check_plan_feedback("owner/repo")
+        self.assertEqual(result, [])
+
+    @patch("code_factory.get_bot_login", return_value="bot-user")
+    @patch("code_factory.gh_json")
+    def test_returns_pr_when_issue_comment_is_newer_than_marker(self, mock_gh_json, mock_login):
+        mock_gh_json.side_effect = [
+            [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix"}],
+            [{"author": {"login": "bot-user"}, "createdAt": "2026-05-05T20:05:00Z", "body": code_factory.PHASE2_MARKER}],
+            [{"author": {"login": "reviewer"}, "createdAt": "2026-05-05T20:10:00Z", "body": "one more change"}],
+        ]
+        result = code_factory.check_plan_feedback("owner/repo")
+        self.assertEqual(result, [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix", "issue_number": 42}])
+
+
 class TestCheckUnclaimed(unittest.TestCase):
     @patch("code_factory.gh_json")
     def test_skips_assigned_issues(self, mock_gh_json):
@@ -242,28 +280,50 @@ class TestPhase2(unittest.TestCase):
 
     @patch("code_factory.llm_reason")
     @patch("code_factory.gh")
+    @patch("code_factory.mark_phase2_processed")
     @patch("code_factory.remove_in_progress")
     @patch("code_factory.add_in_progress")
-    def test_noop_returns_none(self, mock_add, mock_remove, mock_gh, mock_llm):
+    def test_noop_returns_none(self, mock_add, mock_remove, mock_mark, mock_gh, mock_llm):
         mock_gh.return_value = ""
         mock_llm.return_value = '{"action": "noop", "summary": "no feedback"}'
         result = code_factory.phase2_process_feedback(
             repo="owner/repo", pr={"number": 5, "title": "Fix"}
         )
         self.assertIsNone(result)
+        mock_mark.assert_called_once_with("owner/repo", 5, "noop", "no feedback")
         mock_remove.assert_called_once_with("owner/repo", 5)
 
     @patch("code_factory.llm_reason")
     @patch("code_factory.gh")
+    @patch("code_factory.mark_phase2_processed")
     @patch("code_factory.remove_in_progress")
     @patch("code_factory.add_in_progress")
-    def test_malformed_json_returns_none(self, mock_add, mock_remove, mock_gh, mock_llm):
+    def test_malformed_json_returns_none(self, mock_add, mock_remove, mock_mark, mock_gh, mock_llm):
         mock_gh.return_value = ""
         mock_llm.return_value = "not json at all"
         result = code_factory.phase2_process_feedback(
             repo="owner/repo", pr={"number": 5, "title": "Fix"}
         )
         self.assertIsNone(result)
+        mock_mark.assert_not_called()
+        mock_remove.assert_called_once_with("owner/repo", 5)
+
+    @patch("code_factory.llm_reason")
+    @patch("code_factory.gh")
+    @patch("code_factory.mark_phase2_processed")
+    @patch("code_factory.remove_in_progress")
+    @patch("code_factory.add_in_progress")
+    def test_revise_major_marks_processed(self, mock_add, mock_remove, mock_mark, mock_gh, mock_llm):
+        mock_gh.return_value = ""
+        mock_llm.return_value = (
+            '{"action": "revise_major", "summary": "needs rethink", '
+            '"revised_plan": "new plan", "comment": "rethinking"}'
+        )
+        result = code_factory.phase2_process_feedback(
+            repo="owner/repo", pr={"number": 5, "title": "Fix"}
+        )
+        self.assertIsNone(result)
+        mock_mark.assert_called_once_with("owner/repo", 5, "revise_major", "needs rethink")
         mock_remove.assert_called_once_with("owner/repo", 5)
 
 

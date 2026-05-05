@@ -17,6 +17,7 @@ from pathlib import Path
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 AGENT_CLI = "claude"
+PHASE2_MARKER = "<!-- code-factory:phase2-processed -->"
 
 
 def log(msg: str) -> None:
@@ -148,6 +149,10 @@ def get_repo(repo: str | None = None) -> str:
     return gh("repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner")
 
 
+def get_bot_login() -> str:
+    return gh("api", "user", "-q", ".login")
+
+
 def read_repo_conventions(repo: str) -> str:
     conventions = []
     for fname in ("CONTRIBUTING.md", "CLAUDE.md", "AGENTS.md", "CODING_GUIDELINES.md"):
@@ -260,28 +265,42 @@ def check_plan_feedback(repo: str) -> list[dict]:
         "--json", "number,title,headRefName",
     )
     actionable = []
+    bot_login = get_bot_login()
     for pr in prs:
-        pr_count = gh_json(
+        pr_comments = gh_json(
             "pr", "view", str(pr["number"]), "--repo", repo,
             "--json", "comments",
-            "--jq", ".comments | length",
         )
-        pr_count = pr_count if isinstance(pr_count, int) else 0
+        pr_comments = pr_comments if isinstance(pr_comments, list) else []
 
         issue_num = _issue_num_from_branch(pr.get("headRefName", ""))
-        issue_count = 0
+        issue_comments = []
         if issue_num:
             try:
-                issue_count = gh_json(
+                issue_comments = gh_json(
                     "issue", "view", str(issue_num), "--repo", repo,
                     "--json", "comments",
-                    "--jq", ".comments | length",
                 )
-                issue_count = issue_count if isinstance(issue_count, int) else 0
+                issue_comments = issue_comments if isinstance(issue_comments, list) else []
             except RuntimeError:
-                issue_count = 0
+                issue_comments = []
 
-        if pr_count + issue_count > 0:
+        latest_human = None
+        latest_marker = None
+        for comment in [*pr_comments, *issue_comments]:
+            author = ((comment.get("author") or {}).get("login")) or ""
+            created_at = comment.get("createdAt")
+            body = comment.get("body") or ""
+            if not created_at:
+                continue
+            if author == bot_login and PHASE2_MARKER in body:
+                if latest_marker is None or created_at > latest_marker:
+                    latest_marker = created_at
+                continue
+            if author != bot_login and (latest_human is None or created_at > latest_human):
+                latest_human = created_at
+
+        if latest_human and (latest_marker is None or latest_human > latest_marker):
             pr["issue_number"] = issue_num
             actionable.append(pr)
     return actionable
@@ -369,6 +388,15 @@ def parse_claude_json(output: str) -> dict | None:
         return json.loads(cleaned)
     except (json.JSONDecodeError, ValueError):
         return None
+
+
+def mark_phase2_processed(repo: str, num: int, action: str, summary: str | None = None) -> None:
+    body = PHASE2_MARKER
+    if action:
+        body += f"\naction={action}"
+    if summary:
+        body += f"\nsummary={summary}"
+    gh("pr", "comment", str(num), "--repo", repo, "--body", body)
 
 
 def get_pr_branch(repo: str, num: int) -> str:
@@ -505,16 +533,19 @@ def phase2_process_feedback(repo: str, pr: dict) -> tuple[str, dict] | None:
             gh("pr", "edit", str(num), "--repo", repo, "--body", parsed["revised_plan"])
         if parsed.get("comment"):
             gh("pr", "comment", str(num), "--repo", repo, "--body", parsed["comment"])
+        mark_phase2_processed(repo, num, action, parsed.get("summary"))
         remove_in_progress(repo, num)
         return None
 
     if action == "clarify":
         if parsed.get("comment"):
             gh("pr", "comment", str(num), "--repo", repo, "--body", parsed["comment"])
+        mark_phase2_processed(repo, num, action, parsed.get("summary"))
         remove_in_progress(repo, num)
         return None
 
     # noop or unknown
+    mark_phase2_processed(repo, num, action, parsed.get("summary"))
     remove_in_progress(repo, num)
     return None
 
