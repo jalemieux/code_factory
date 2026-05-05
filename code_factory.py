@@ -32,16 +32,25 @@ def _fmt_argv(prog: str, args: tuple[str, ...]) -> str:
 
 
 def gh(*args: str) -> str:
-    """Run a gh CLI command and return stdout, retrying on rate limits."""
+    """Run a gh CLI command and return stdout, retrying on rate limits and transient server errors."""
     for attempt in range(4):
         result = subprocess.run(
             ["gh", *args], capture_output=True, text=True
         )
         if result.returncode == 0:
             return result.stdout.strip()
-        if "rate limit" in result.stderr.lower() and attempt < 3:
+        stderr_lower = result.stderr.lower()
+        transient = (
+            "rate limit" in stderr_lower
+            or re.search(r"http 5\d\d", stderr_lower)
+            or "gateway timeout" in stderr_lower
+            or "timeout" in stderr_lower
+            or "temporarily unavailable" in stderr_lower
+            or "connection reset" in stderr_lower
+        )
+        if transient and attempt < 3:
             wait = 2 ** attempt * 15
-            log(f"Rate limited, retrying in {wait}s...")
+            log(f"Transient gh error, retrying in {wait}s: {result.stderr.strip()[:120]}")
             time.sleep(wait)
             continue
         detail = result.stderr.strip() or result.stdout.strip() or "<no output>"
