@@ -149,10 +149,6 @@ def get_repo(repo: str | None = None) -> str:
     return gh("repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner")
 
 
-def get_bot_login() -> str:
-    return gh("api", "user", "-q", ".login")
-
-
 def read_repo_conventions(repo: str) -> str:
     conventions = []
     for fname in ("CONTRIBUTING.md", "CLAUDE.md", "AGENTS.md", "CODING_GUIDELINES.md"):
@@ -257,6 +253,11 @@ def check_plan_feedback(repo: str) -> list[dict]:
     on `--draft`, because a prior partial run or a manual "ready for review"
     click can flip draft state without changing the label, which would
     otherwise strand the PR with unprocessed feedback.
+
+    Bot vs. human comments are distinguished by the PHASE2_MARKER, not by
+    `author.login` — when the bot runs as the human user (same gh account),
+    every comment shares the same login, so the marker is the only reliable
+    signal that a comment came from the bot.
     """
     prs = gh_json(
         "pr", "list", "--repo", repo,
@@ -265,39 +266,38 @@ def check_plan_feedback(repo: str) -> list[dict]:
         "--json", "number,title,headRefName",
     )
     actionable = []
-    bot_login = get_bot_login()
     for pr in prs:
-        pr_comments = gh_json(
+        # `gh ... --json comments` returns {"comments": [...]} — unwrap to the list.
+        pr_payload = gh_json(
             "pr", "view", str(pr["number"]), "--repo", repo,
             "--json", "comments",
         )
-        pr_comments = pr_comments if isinstance(pr_comments, list) else []
+        pr_comments = pr_payload.get("comments", []) if isinstance(pr_payload, dict) else []
 
         issue_num = _issue_num_from_branch(pr.get("headRefName", ""))
         issue_comments = []
         if issue_num:
             try:
-                issue_comments = gh_json(
+                issue_payload = gh_json(
                     "issue", "view", str(issue_num), "--repo", repo,
                     "--json", "comments",
                 )
-                issue_comments = issue_comments if isinstance(issue_comments, list) else []
+                issue_comments = issue_payload.get("comments", []) if isinstance(issue_payload, dict) else []
             except RuntimeError:
                 issue_comments = []
 
         latest_human = None
         latest_marker = None
         for comment in [*pr_comments, *issue_comments]:
-            author = ((comment.get("author") or {}).get("login")) or ""
             created_at = comment.get("createdAt")
             body = comment.get("body") or ""
             if not created_at:
                 continue
-            if author == bot_login and PHASE2_MARKER in body:
+            if PHASE2_MARKER in body:
                 if latest_marker is None or created_at > latest_marker:
                     latest_marker = created_at
                 continue
-            if author != bot_login and (latest_human is None or created_at > latest_human):
+            if latest_human is None or created_at > latest_human:
                 latest_human = created_at
 
         if latest_human and (latest_marker is None or latest_human > latest_marker):

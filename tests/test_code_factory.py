@@ -115,38 +115,51 @@ class TestCheckReviewRequested(unittest.TestCase):
 
 
 class TestCheckPlanFeedback(unittest.TestCase):
-    @patch("code_factory.get_bot_login", return_value="bot-user")
+    # `gh ... --json comments` returns {"comments": [...]}, not a bare list — match real shape.
     @patch("code_factory.gh_json")
-    def test_returns_pr_when_human_comment_has_no_marker(self, mock_gh_json, mock_login):
+    def test_returns_pr_when_human_comment_has_no_marker(self, mock_gh_json):
         mock_gh_json.side_effect = [
             [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix"}],
-            [{"author": {"login": "reviewer"}, "createdAt": "2026-05-05T20:00:00Z", "body": "please revise"}],
-            [],
+            {"comments": [{"author": {"login": "reviewer"}, "createdAt": "2026-05-05T20:00:00Z", "body": "please revise"}]},
+            {"comments": []},
         ]
         result = code_factory.check_plan_feedback("owner/repo")
         self.assertEqual(result, [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix", "issue_number": 42}])
 
-    @patch("code_factory.get_bot_login", return_value="bot-user")
     @patch("code_factory.gh_json")
-    def test_skips_pr_when_marker_is_newer_than_human_comment(self, mock_gh_json, mock_login):
+    def test_skips_pr_when_marker_is_newer_than_human_comment(self, mock_gh_json):
         mock_gh_json.side_effect = [
             [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix"}],
-            [
+            {"comments": [
                 {"author": {"login": "reviewer"}, "createdAt": "2026-05-05T20:00:00Z", "body": "please revise"},
                 {"author": {"login": "bot-user"}, "createdAt": "2026-05-05T20:05:00Z", "body": code_factory.PHASE2_MARKER},
-            ],
-            [],
+            ]},
+            {"comments": []},
         ]
         result = code_factory.check_plan_feedback("owner/repo")
         self.assertEqual(result, [])
 
-    @patch("code_factory.get_bot_login", return_value="bot-user")
     @patch("code_factory.gh_json")
-    def test_returns_pr_when_issue_comment_is_newer_than_marker(self, mock_gh_json, mock_login):
+    def test_returns_pr_when_issue_comment_is_newer_than_marker(self, mock_gh_json):
         mock_gh_json.side_effect = [
             [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix"}],
-            [{"author": {"login": "bot-user"}, "createdAt": "2026-05-05T20:05:00Z", "body": code_factory.PHASE2_MARKER}],
-            [{"author": {"login": "reviewer"}, "createdAt": "2026-05-05T20:10:00Z", "body": "one more change"}],
+            {"comments": [{"author": {"login": "bot-user"}, "createdAt": "2026-05-05T20:05:00Z", "body": code_factory.PHASE2_MARKER}]},
+            {"comments": [{"author": {"login": "reviewer"}, "createdAt": "2026-05-05T20:10:00Z", "body": "one more change"}]},
+        ]
+        result = code_factory.check_plan_feedback("owner/repo")
+        self.assertEqual(result, [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix", "issue_number": 42}])
+
+    @patch("code_factory.gh_json")
+    def test_human_comments_detected_when_bot_shares_user_account(self, mock_gh_json):
+        # Bot runs as the human user, so author.login is identical for both.
+        # The marker — not the login — is what distinguishes bot from human.
+        mock_gh_json.side_effect = [
+            [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix"}],
+            {"comments": [
+                {"author": {"login": "shared-user"}, "createdAt": "2026-05-05T20:00:00Z", "body": "lgtm"},
+                {"author": {"login": "shared-user"}, "createdAt": "2026-05-05T20:10:00Z", "body": "actually, design question..."},
+            ]},
+            {"comments": []},
         ]
         result = code_factory.check_plan_feedback("owner/repo")
         self.assertEqual(result, [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix", "issue_number": 42}])
