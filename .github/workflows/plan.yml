@@ -2,7 +2,7 @@ name: Plan
 
 on:
   issues:
-    types: [opened]
+    types: [opened, labeled]
   issue_comment:
     types: [created]
 
@@ -10,10 +10,13 @@ permissions:
   contents: write
   pull-requests: write
   issues: write
+  id-token: write
 
 jobs:
   propose-plan:
-    if: github.event_name == 'issues' && github.event.action == 'opened'
+    if: >-
+      (github.event_name == 'issues' && github.event.action == 'opened') ||
+      (github.event_name == 'issues' && github.event.action == 'labeled' && github.event.label.name == 'bot:plan')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
