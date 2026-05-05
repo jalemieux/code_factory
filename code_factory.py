@@ -354,6 +354,11 @@ def phase1_claim_and_plan(repo: str, issue: dict) -> tuple[str, dict] | None:
     ensure_labels(repo)
 
     issue_body = gh("issue", "view", str(num), "--repo", repo, "--json", "body", "-q", ".body")
+    issue_comments = gh(
+        "issue", "view", str(num), "--repo", repo,
+        "--json", "comments",
+        "--jq", r'.comments[] | "\(.author.login) (\(.createdAt)): \(.body)"',
+    ) or "(none)"
     conventions = read_repo_conventions(repo)
     recent_prs = gh(
         "pr", "list", "--repo", repo, "--state", "merged",
@@ -379,6 +384,7 @@ def phase1_claim_and_plan(repo: str, issue: dict) -> tuple[str, dict] | None:
         issue_number=str(num),
         issue_title=title,
         issue_body=issue_body or "(no description)",
+        issue_comments=issue_comments,
         conventions=conventions,
         recent_prs=recent_prs,
     )

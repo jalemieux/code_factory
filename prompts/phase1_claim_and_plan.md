@@ -4,6 +4,15 @@ You are proposing an implementation plan for a GitHub issue.
 
 {issue_body}
 
+## Existing Comments on the Issue
+
+These comments were left on the issue before you began planning. Treat them as
+authoritative input from reviewers — they refine, constrain, or override the
+original issue body. If a comment proposes a different approach, default to it
+unless it conflicts with the issue's stated goal.
+
+{issue_comments}
+
 ## Repository Conventions
 
 {conventions}
