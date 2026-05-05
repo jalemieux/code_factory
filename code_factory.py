@@ -273,27 +273,38 @@ def check_accepted_plans(repo: str) -> list[dict]:
 
 
 def check_unclaimed_issues(repo: str) -> list[dict]:
-    """Priority 4: Unassigned open issues with no linked open PRs."""
+    """Priority 4: Unassigned open issues with no existing plan PR from this bot.
+
+    "Linked" = there's an open PR on a branch named `bot/<N>-*`. We don't use
+    `--search "#N"` because GitHub does a fuzzy substring match across all PR
+    text, so an unrelated PR mentioning "#65" anywhere in its body would mask a
+    genuinely unclaimed issue.
+    """
     issues = gh_json(
         "issue", "list", "--repo", repo,
         "--state", "open",
         "--json", "number,title,labels,assignees",
         "--limit", "20",
     )
+    open_bot_prs = gh_json(
+        "pr", "list", "--repo", repo,
+        "--state", "open",
+        "--json", "headRefName",
+        "--limit", "100",
+    )
+    claimed_nums = set()
+    for pr in open_bot_prs:
+        n = _issue_num_from_branch(pr.get("headRefName", ""))
+        if n is not None:
+            claimed_nums.add(n)
+
     actionable = []
     for issue in issues:
         if issue.get("assignees"):
             continue
-        linked_prs = gh_json(
-            "pr", "list", "--repo", repo,
-            "--search", f"#{issue['number']}",
-            "--state", "open",
-            "--json", "number",
-            "--jq", "length",
-        )
-        count = linked_prs if isinstance(linked_prs, int) else len(linked_prs)
-        if count == 0:
-            actionable.append(issue)
+        if issue["number"] in claimed_nums:
+            continue
+        actionable.append(issue)
     # Prefer issues with good-first-issue or help-wanted labels
     preferred = {"good first issue", "good-first-issue", "help wanted", "help-wanted"}
     def sort_key(issue: dict) -> int:
