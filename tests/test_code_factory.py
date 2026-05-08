@@ -98,17 +98,34 @@ class TestCheckReviewRequested(unittest.TestCase):
     @patch("code_factory.gh_json")
     def test_returns_pr_when_review_newer_than_commit(self, mock_gh_json):
         mock_gh_json.side_effect = [
-            [{"number": 5, "title": "Fix", "updatedAt": "2026-01-01"}],
+            [{"number": 5, "title": "Fix", "updatedAt": "2026-01-01",
+              "labels": [{"name": "bot:review-requested"}]}],
             {"last_review": "2026-03-20T10:00:00Z", "last_commit": "2026-03-19T10:00:00Z"},
         ]
         result = code_factory.check_review_requested("owner/repo")
-        self.assertEqual(result, [{"number": 5, "title": "Fix", "updatedAt": "2026-01-01"}])
+        self.assertEqual(
+            result,
+            [{"number": 5, "title": "Fix", "updatedAt": "2026-01-01",
+              "labels": [{"name": "bot:review-requested"}]}],
+        )
 
     @patch("code_factory.gh_json")
     def test_skips_pr_when_commit_newer_than_review(self, mock_gh_json):
         mock_gh_json.side_effect = [
-            [{"number": 5, "title": "Fix", "updatedAt": "2026-01-01"}],
+            [{"number": 5, "title": "Fix", "updatedAt": "2026-01-01",
+              "labels": [{"name": "bot:review-requested"}]}],
             {"last_review": "2026-03-19T10:00:00Z", "last_commit": "2026-03-20T10:00:00Z"},
+        ]
+        result = code_factory.check_review_requested("owner/repo")
+        self.assertEqual(result, [])
+
+    @patch("code_factory.gh_json")
+    def test_skips_pr_when_search_index_is_stale(self, mock_gh_json):
+        # gh's label search is eventually consistent — it can return a PR whose
+        # actual labels no longer include the filter. Don't trust the search.
+        mock_gh_json.side_effect = [
+            [{"number": 5, "title": "Fix", "updatedAt": "2026-01-01",
+              "labels": [{"name": "bot:plan-accepted"}]}],
         ]
         result = code_factory.check_review_requested("owner/repo")
         self.assertEqual(result, [])
@@ -119,17 +136,23 @@ class TestCheckPlanFeedback(unittest.TestCase):
     @patch("code_factory.gh_json")
     def test_returns_pr_when_human_comment_has_no_marker(self, mock_gh_json):
         mock_gh_json.side_effect = [
-            [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix"}],
+            [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix",
+              "labels": [{"name": "bot:plan-proposed"}]}],
             {"comments": [{"author": {"login": "reviewer"}, "createdAt": "2026-05-05T20:00:00Z", "body": "please revise"}]},
             {"comments": []},
         ]
         result = code_factory.check_plan_feedback("owner/repo")
-        self.assertEqual(result, [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix", "issue_number": 42}])
+        self.assertEqual(
+            result,
+            [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix",
+              "labels": [{"name": "bot:plan-proposed"}], "issue_number": 42}],
+        )
 
     @patch("code_factory.gh_json")
     def test_skips_pr_when_marker_is_newer_than_human_comment(self, mock_gh_json):
         mock_gh_json.side_effect = [
-            [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix"}],
+            [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix",
+              "labels": [{"name": "bot:plan-proposed"}]}],
             {"comments": [
                 {"author": {"login": "reviewer"}, "createdAt": "2026-05-05T20:00:00Z", "body": "please revise"},
                 {"author": {"login": "bot-user"}, "createdAt": "2026-05-05T20:05:00Z", "body": code_factory.PHASE2_MARKER},
@@ -142,19 +165,25 @@ class TestCheckPlanFeedback(unittest.TestCase):
     @patch("code_factory.gh_json")
     def test_returns_pr_when_issue_comment_is_newer_than_marker(self, mock_gh_json):
         mock_gh_json.side_effect = [
-            [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix"}],
+            [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix",
+              "labels": [{"name": "bot:plan-proposed"}]}],
             {"comments": [{"author": {"login": "bot-user"}, "createdAt": "2026-05-05T20:05:00Z", "body": code_factory.PHASE2_MARKER}]},
             {"comments": [{"author": {"login": "reviewer"}, "createdAt": "2026-05-05T20:10:00Z", "body": "one more change"}]},
         ]
         result = code_factory.check_plan_feedback("owner/repo")
-        self.assertEqual(result, [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix", "issue_number": 42}])
+        self.assertEqual(
+            result,
+            [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix",
+              "labels": [{"name": "bot:plan-proposed"}], "issue_number": 42}],
+        )
 
     @patch("code_factory.gh_json")
     def test_human_comments_detected_when_bot_shares_user_account(self, mock_gh_json):
         # Bot runs as the human user, so author.login is identical for both.
         # The marker — not the login — is what distinguishes bot from human.
         mock_gh_json.side_effect = [
-            [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix"}],
+            [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix",
+              "labels": [{"name": "bot:plan-proposed"}]}],
             {"comments": [
                 {"author": {"login": "shared-user"}, "createdAt": "2026-05-05T20:00:00Z", "body": "lgtm"},
                 {"author": {"login": "shared-user"}, "createdAt": "2026-05-05T20:10:00Z", "body": "actually, design question..."},
@@ -162,7 +191,23 @@ class TestCheckPlanFeedback(unittest.TestCase):
             {"comments": []},
         ]
         result = code_factory.check_plan_feedback("owner/repo")
-        self.assertEqual(result, [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix", "issue_number": 42}])
+        self.assertEqual(
+            result,
+            [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix",
+              "labels": [{"name": "bot:plan-proposed"}], "issue_number": 42}],
+        )
+
+    @patch("code_factory.gh_json")
+    def test_skips_pr_when_search_index_is_stale(self, mock_gh_json):
+        # Reproduces the loop bug: gh's label search returned a PR whose actual
+        # labels are review-requested + in-progress (no plan-proposed). Without
+        # this guard, phase 2 fires repeatedly on the same already-handled PR.
+        mock_gh_json.side_effect = [
+            [{"number": 80, "title": "Fix", "headRefName": "bot/77-fix",
+              "labels": [{"name": "bot:review-requested"}, {"name": "bot:in-progress"}]}],
+        ]
+        result = code_factory.check_plan_feedback("owner/repo")
+        self.assertEqual(result, [])
 
 
 class TestCheckUnclaimed(unittest.TestCase):
@@ -280,9 +325,10 @@ class TestPhase5(unittest.TestCase):
 class TestPhase2(unittest.TestCase):
     @patch("code_factory.llm_reason")
     @patch("code_factory.gh")
+    @patch("code_factory.mark_phase2_processed")
     @patch("code_factory.swap_label")
     @patch("code_factory.add_in_progress")
-    def test_approve_chains_to_phase4(self, mock_add, mock_swap, mock_gh, mock_llm):
+    def test_approve_chains_to_phase4(self, mock_add, mock_swap, mock_mark, mock_gh, mock_llm):
         mock_gh.return_value = "user1 (2026-03-20): LGTM"
         mock_llm.return_value = '{"action": "approve", "summary": "approved"}'
         result = code_factory.phase2_process_feedback(
@@ -290,6 +336,9 @@ class TestPhase2(unittest.TestCase):
         )
         self.assertEqual(result[0], "phase4_implement")
         mock_swap.assert_called_once_with("owner/repo", 5, "bot:plan-proposed", "bot:plan-accepted")
+        # Marker prevents re-classifying the same approval if the label briefly
+        # reappears (manual relabel, race with GH Actions, stale search index).
+        mock_mark.assert_called_once_with("owner/repo", 5, "approve", "approved")
 
     @patch("code_factory.llm_reason")
     @patch("code_factory.gh")

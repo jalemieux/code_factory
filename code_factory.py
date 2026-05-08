@@ -149,6 +149,18 @@ def get_repo(repo: str | None = None) -> str:
     return gh("repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner")
 
 
+def _has_label(pr: dict, name: str) -> bool:
+    """Authoritative check for label presence.
+
+    `gh pr list --label X` queries the search index, which is eventually
+    consistent — when labels flip rapidly it returns PRs whose actual
+    labels no longer include X. The labels embedded in `--json labels`
+    come from the PR detail API and reflect current state, so we
+    re-verify before trusting a search hit.
+    """
+    return any(l.get("name") == name for l in pr.get("labels", []))
+
+
 def read_repo_conventions(repo: str) -> str:
     conventions = []
     for fname in ("CONTRIBUTING.md", "CLAUDE.md", "AGENTS.md", "CODING_GUIDELINES.md"):
@@ -218,9 +230,9 @@ def get_in_progress_prs(repo: str) -> set[int]:
         "pr", "list", "--repo", repo,
         "--author", "@me",
         "--label", "bot:in-progress",
-        "--json", "number",
+        "--json", "number,labels",
     )
-    return {pr["number"] for pr in prs}
+    return {pr["number"] for pr in prs if _has_label(pr, "bot:in-progress")}
 
 
 def check_review_requested(repo: str) -> list[dict]:
@@ -229,10 +241,12 @@ def check_review_requested(repo: str) -> list[dict]:
         "pr", "list", "--repo", repo,
         "--author", "@me",
         "--label", "bot:review-requested",
-        "--json", "number,title,updatedAt",
+        "--json", "number,title,updatedAt,labels",
     )
     actionable = []
     for pr in prs:
+        if not _has_label(pr, "bot:review-requested"):
+            continue
         info = gh_json(
             "pr", "view", str(pr["number"]), "--repo", repo,
             "--json", "reviews,commits",
@@ -263,10 +277,12 @@ def check_plan_feedback(repo: str) -> list[dict]:
         "pr", "list", "--repo", repo,
         "--author", "@me",
         "--label", "bot:plan-proposed",
-        "--json", "number,title,headRefName",
+        "--json", "number,title,headRefName,labels",
     )
     actionable = []
     for pr in prs:
+        if not _has_label(pr, "bot:plan-proposed"):
+            continue
         # `gh ... --json comments` returns {"comments": [...]} — unwrap to the list.
         pr_payload = gh_json(
             "pr", "view", str(pr["number"]), "--repo", repo,
@@ -308,12 +324,13 @@ def check_plan_feedback(repo: str) -> list[dict]:
 
 def check_accepted_plans(repo: str) -> list[dict]:
     """Priority 3: Accepted plans ready for implementation."""
-    return gh_json(
+    prs = gh_json(
         "pr", "list", "--repo", repo,
         "--author", "@me",
         "--label", "bot:plan-accepted",
-        "--json", "number,title",
+        "--json", "number,title,labels",
     )
+    return [pr for pr in prs if _has_label(pr, "bot:plan-accepted")]
 
 
 def check_unclaimed_issues(repo: str) -> list[dict]:
@@ -519,12 +536,14 @@ def phase2_process_feedback(repo: str, pr: dict) -> tuple[str, dict] | None:
     log(f"Phase 2: feedback classified as '{action}'")
 
     if action == "approve":
+        mark_phase2_processed(repo, num, action, parsed.get("summary"))
         swap_label(repo, num, "bot:plan-proposed", "bot:plan-accepted")
         return ("phase4_implement", {"repo": repo, "pr": pr})
 
     if action == "revise_minor":
         if parsed.get("revised_plan"):
             gh("pr", "edit", str(num), "--repo", repo, "--body", parsed["revised_plan"])
+        mark_phase2_processed(repo, num, action, parsed.get("summary"))
         swap_label(repo, num, "bot:plan-proposed", "bot:plan-accepted")
         return ("phase4_implement", {"repo": repo, "pr": pr})
 
