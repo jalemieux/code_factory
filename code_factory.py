@@ -16,12 +16,49 @@ from datetime import datetime
 from pathlib import Path
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
+ENV_FILE = Path(__file__).parent / ".env"
 AGENT_CLI = "claude"
 PHASE2_MARKER = "<!-- code-factory:phase2-processed -->"
 
 
 def log(msg: str) -> None:
     print(f"{datetime.now():%Y-%m-%d %H:%M:%S} — {msg}", file=sys.stderr)
+
+
+def load_env(path: Path = ENV_FILE) -> None:
+    """Load KEY=VALUE pairs from a .env next to the script into os.environ.
+
+    Values in `.env` win over the surrounding shell — the file is the
+    authoritative bot identity, so a personal `export GH_TOKEN=...` in
+    the user's shell shouldn't silently take over.
+
+    `GIT_AUTHOR_NAME`/`EMAIL` automatically populate the committer
+    identity too if those aren't set explicitly, so a single pair of
+    keys is enough for the common case.
+    """
+    if not path.exists():
+        return
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if (len(value) >= 2) and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        if key:
+            os.environ[key] = value
+    if "GH_TOKEN" in os.environ and "GITHUB_TOKEN" not in os.environ:
+        os.environ["GITHUB_TOKEN"] = os.environ["GH_TOKEN"]
+    for src, dst in (
+        ("GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"),
+        ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"),
+    ):
+        if src in os.environ and dst not in os.environ:
+            os.environ[dst] = os.environ[src]
 
 
 def _fmt_argv(prog: str, args: tuple[str, ...]) -> str:
@@ -69,7 +106,17 @@ def gh_json(*args: str) -> list | dict:
 
 def git(*args: str) -> str:
     """Run a git command, raise on failure."""
-    result = subprocess.run(["git", *args], capture_output=True, text=True)
+    cmd = ["git"]
+    if os.environ.get("GH_TOKEN"):
+        # Force github.com pushes/fetches to authenticate with the token from
+        # `.env` (via `gh auth git-credential`) rather than whatever https
+        # credentials the user has cached for their personal account.
+        cmd.extend([
+            "-c", "credential.helper=",
+            "-c", "credential.https://github.com.helper=!gh auth git-credential",
+        ])
+    cmd.extend(args)
+    result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or "<no output>"
         raise RuntimeError(
@@ -737,6 +784,10 @@ def main() -> None:
 
     global AGENT_CLI
     AGENT_CLI = agent
+
+    load_env()
+    if "GH_TOKEN" in os.environ:
+        log(f"Using GH_TOKEN from {ENV_FILE.name}")
 
     repo = get_repo(args.repo)
     log(f"Code Factory targeting: {repo} (agent: {AGENT_CLI})")

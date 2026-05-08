@@ -118,3 +118,7 @@ An older polling-based approach is also available via `code_factory.py`. It requ
 python3 code_factory.py --repo owner/repo       # Continuous polling
 python3 code_factory.py --once --repo owner/repo # Single pass
 ```
+
+### Configuring the bot's GitHub identity
+
+Copy `.env.example` to `.env` (next to `code_factory.py`) and fill in `GH_TOKEN` plus the author name/email you want on bot commits. The script loads `.env` at startup and uses it for both `gh` and `git`, overriding any token cached by `gh auth login` or stored git credentials. `.env` is gitignored.
