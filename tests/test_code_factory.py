@@ -51,6 +51,48 @@ class TestGhJson(unittest.TestCase):
         self.assertEqual(result, [])
 
 
+class TestFetchReviewPayload(unittest.TestCase):
+    @patch("code_factory.gh")
+    def test_returns_pull_request_subtree_with_inline_comments(self, mock_gh):
+        mock_gh.return_value = json.dumps({
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviews": {"nodes": [
+                            {"author": {"login": "alice"}, "state": "CHANGES_REQUESTED",
+                             "submittedAt": "2026-05-14T00:00:00Z", "body": "please fix"}
+                        ]},
+                        "reviewThreads": {"nodes": [
+                            {"isResolved": False, "isOutdated": False,
+                             "comments": {"nodes": [
+                                 {"author": {"login": "alice"}, "body": "rename this",
+                                  "path": "src/foo.py", "line": 42, "originalLine": 42,
+                                  "diffHunk": "@@ ...", "createdAt": "2026-05-14T00:00:00Z"}
+                             ]}}
+                        ]}
+                    }
+                }
+            }
+        })
+        result = code_factory.fetch_review_payload("owner/repo", 42)
+        parsed = json.loads(result)
+        self.assertEqual(parsed["reviews"]["nodes"][0]["state"], "CHANGES_REQUESTED")
+        inline = parsed["reviewThreads"]["nodes"][0]["comments"]["nodes"][0]
+        self.assertEqual(inline["body"], "rename this")
+        self.assertEqual(inline["path"], "src/foo.py")
+        self.assertEqual(inline["line"], 42)
+
+    @patch("code_factory.gh")
+    def test_invokes_graphql_with_owner_name_and_num(self, mock_gh):
+        mock_gh.return_value = json.dumps({"data": {"repository": {"pullRequest": {}}}})
+        code_factory.fetch_review_payload("acme/widget", 7)
+        args = mock_gh.call_args[0]
+        self.assertEqual(args[0:2], ("api", "graphql"))
+        self.assertIn("owner=acme", args)
+        self.assertIn("name=widget", args)
+        self.assertIn("num=7", args)
+
+
 class TestSlugify(unittest.TestCase):
     def test_basic_slug(self):
         self.assertEqual(code_factory.slugify("Fix the Bug"), "fix-the-bug")

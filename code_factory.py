@@ -104,6 +104,46 @@ def gh_json(*args: str) -> list | dict:
     return json.loads(gh(*args) or "[]")
 
 
+def fetch_review_payload(repo: str, num: int) -> str:
+    """Return reviews + per-line review thread comments as pretty JSON.
+
+    `gh pr view --json reviews` only carries review summaries, not the
+    line-level diff comments inside each review, and `reviewThreads` isn't
+    a `gh pr view` field at all (it's a GraphQL field on `pullRequest`).
+    We need both — the prompt asks the LLM to reason about inline comments
+    and unresolved threads, so we fetch them via GraphQL in one call.
+    """
+    owner, name = repo.split("/", 1)
+    query = (
+        "query($owner: String!, $name: String!, $num: Int!) {"
+        "  repository(owner: $owner, name: $name) {"
+        "    pullRequest(number: $num) {"
+        "      reviews(first: 50) {"
+        "        nodes { author { login } state submittedAt body }"
+        "      }"
+        "      reviewThreads(first: 100) {"
+        "        nodes {"
+        "          isResolved isOutdated"
+        "          comments(first: 50) {"
+        "            nodes { author { login } body path line originalLine diffHunk createdAt }"
+        "          }"
+        "        }"
+        "      }"
+        "    }"
+        "  }"
+        "}"
+    )
+    raw = gh(
+        "api", "graphql",
+        "-f", f"query={query}",
+        "-F", f"owner={owner}",
+        "-F", f"name={name}",
+        "-F", f"num={num}",
+    )
+    pr_data = json.loads(raw).get("data", {}).get("repository", {}).get("pullRequest", {})
+    return json.dumps(pr_data, indent=2)
+
+
 def git(*args: str) -> str:
     """Run a git command, raise on failure."""
     cmd = ["git"]
@@ -670,10 +710,7 @@ def phase6_process_review(repo: str, pr: dict) -> tuple[str, dict] | None:
     log(f"Phase 6: processing review on PR #{num}")
     add_in_progress(repo, num)
 
-    reviews = gh(
-        "pr", "view", str(num), "--repo", repo,
-        "--json", "reviews,reviewThreads",
-    )
+    reviews = fetch_review_payload(repo, num)
 
     prompt = load_prompt(
         "phase6_process_review",
@@ -714,7 +751,8 @@ def phase6_process_review(repo: str, pr: dict) -> tuple[str, dict] | None:
         llm_interactive(fix_prompt, workdir)
 
         review_data = json.loads(reviews)
-        reviewers = {r["author"]["login"] for r in review_data.get("reviews", []) if r.get("author")}
+        review_nodes = review_data.get("reviews", {}).get("nodes", []) if isinstance(review_data.get("reviews"), dict) else review_data.get("reviews", [])
+        reviewers = {r["author"]["login"] for r in review_nodes if r.get("author")}
         for reviewer in reviewers:
             try:
                 gh("pr", "edit", str(num), "--repo", repo, "--add-reviewer", reviewer)
