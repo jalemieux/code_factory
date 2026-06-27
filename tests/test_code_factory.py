@@ -252,9 +252,10 @@ class TestCheckPlanFeedback(unittest.TestCase):
         self.assertEqual(result, [])
 
 
+@patch("code_factory.bot_login", return_value="botuser")
 class TestCheckUnclaimed(unittest.TestCase):
     @patch("code_factory.gh_json")
-    def test_skips_assigned_issues(self, mock_gh_json):
+    def test_skips_assigned_issues(self, mock_gh_json, _mock_login):
         mock_gh_json.return_value = [
             {"number": 1, "title": "Bug", "labels": [], "assignees": [{"login": "bob"}]},
         ]
@@ -262,7 +263,28 @@ class TestCheckUnclaimed(unittest.TestCase):
         self.assertEqual(result, [])
 
     @patch("code_factory.gh_json")
-    def test_skips_issues_with_open_prs(self, mock_gh_json):
+    def test_picks_up_self_assigned_issue(self, mock_gh_json, _mock_login):
+        # Issue assigned only to the bot itself (e.g. a crashed prior claim with
+        # no plan PR) must still be picked up, not treated as claimed by another.
+        mock_gh_json.side_effect = [
+            [{"number": 1, "title": "Bug", "labels": [], "assignees": [{"login": "botuser"}]}],
+            [],
+        ]
+        result = code_factory.check_unclaimed_issues("owner/repo")
+        self.assertEqual(result[0]["number"], 1)
+
+    @patch("code_factory.gh_json")
+    def test_skips_issue_assigned_to_bot_and_human(self, mock_gh_json, _mock_login):
+        # A human assignee alongside the bot still means a human owns it.
+        mock_gh_json.return_value = [
+            {"number": 1, "title": "Bug", "labels": [],
+             "assignees": [{"login": "botuser"}, {"login": "bob"}]},
+        ]
+        result = code_factory.check_unclaimed_issues("owner/repo")
+        self.assertEqual(result, [])
+
+    @patch("code_factory.gh_json")
+    def test_skips_issues_with_open_prs(self, mock_gh_json, _mock_login):
         mock_gh_json.side_effect = [
             [{"number": 1, "title": "Bug", "labels": [], "assignees": []}],
             [{"headRefName": "bot/1-bug"}],
@@ -271,7 +293,7 @@ class TestCheckUnclaimed(unittest.TestCase):
         self.assertEqual(result, [])
 
     @patch("code_factory.gh_json")
-    def test_returns_unassigned_issue_with_no_prs(self, mock_gh_json):
+    def test_returns_unassigned_issue_with_no_prs(self, mock_gh_json, _mock_login):
         mock_gh_json.side_effect = [
             [{"number": 1, "title": "Bug", "labels": [], "assignees": []}],
             [],

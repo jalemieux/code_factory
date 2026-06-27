@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
@@ -102,6 +103,12 @@ def gh(*args: str) -> str:
 
 def gh_json(*args: str) -> list | dict:
     return json.loads(gh(*args) or "[]")
+
+
+@lru_cache(maxsize=1)
+def bot_login() -> str:
+    """The gh login this bot authenticates as. Cached — it can't change mid-run."""
+    return gh("api", "user", "-q", ".login")
 
 
 def fetch_review_payload(repo: str, num: int) -> str:
@@ -315,7 +322,6 @@ def llm_interactive(prompt: str, workdir: str) -> str:
 def get_in_progress_prs(repo: str) -> set[int]:
     prs = gh_json(
         "pr", "list", "--repo", repo,
-        "--author", "@me",
         "--label", "bot:in-progress",
         "--json", "number,labels",
     )
@@ -323,10 +329,14 @@ def get_in_progress_prs(repo: str) -> set[int]:
 
 
 def check_review_requested(repo: str) -> list[dict]:
-    """Priority 1: Own PRs with code review feedback."""
+    """Priority 1: PRs with code review feedback.
+
+    Authorship is intentionally not filtered — a `bot:*` label is the opt-in
+    signal that the bot should act on a PR, regardless of who opened it. This
+    lets a human author a plan PR by hand and hand it off by labeling.
+    """
     prs = gh_json(
         "pr", "list", "--repo", repo,
-        "--author", "@me",
         "--label", "bot:review-requested",
         "--json", "number,title,updatedAt,labels",
     )
@@ -348,7 +358,7 @@ def check_review_requested(repo: str) -> list[dict]:
 
 
 def check_plan_feedback(repo: str) -> list[dict]:
-    """Priority 2: Own plan PRs with feedback (on the PR or the linked issue).
+    """Priority 2: Plan PRs with feedback (on the PR or the linked issue).
 
     The `bot:plan-proposed` label is the source of truth — we don't also gate
     on `--draft`, because a prior partial run or a manual "ready for review"
@@ -362,7 +372,6 @@ def check_plan_feedback(repo: str) -> list[dict]:
     """
     prs = gh_json(
         "pr", "list", "--repo", repo,
-        "--author", "@me",
         "--label", "bot:plan-proposed",
         "--json", "number,title,headRefName,labels",
     )
@@ -413,7 +422,6 @@ def check_accepted_plans(repo: str) -> list[dict]:
     """Priority 3: Accepted plans ready for implementation."""
     prs = gh_json(
         "pr", "list", "--repo", repo,
-        "--author", "@me",
         "--label", "bot:plan-accepted",
         "--json", "number,title,labels",
     )
@@ -421,12 +429,18 @@ def check_accepted_plans(repo: str) -> list[dict]:
 
 
 def check_unclaimed_issues(repo: str) -> list[dict]:
-    """Priority 4: Unassigned open issues with no existing plan PR from this bot.
+    """Priority 4: Open issues claimable by this bot with no existing plan PR.
 
     "Linked" = there's an open PR on a branch named `bot/<N>-*`. We don't use
     `--search "#N"` because GitHub does a fuzzy substring match across all PR
     text, so an unrelated PR mentioning "#65" anywhere in its body would mask a
     genuinely unclaimed issue.
+
+    A self-assignment is not a blocker: phase 1 self-assigns the issue before
+    opening the plan PR (so the bot can flag intent), and a crash between those
+    two steps would otherwise strand the issue — assigned-to-self but with no
+    PR, invisible to both the assignee filter and the branch dedup. We skip
+    only issues assigned to *someone else*, which is a human claiming the work.
     """
     issues = gh_json(
         "issue", "list", "--repo", repo,
@@ -446,9 +460,11 @@ def check_unclaimed_issues(repo: str) -> list[dict]:
         if n is not None:
             claimed_nums.add(n)
 
+    me = bot_login()
     actionable = []
     for issue in issues:
-        if issue.get("assignees"):
+        others = [a for a in issue.get("assignees", []) if a.get("login") != me]
+        if others:
             continue
         if issue["number"] in claimed_nums:
             continue
@@ -517,8 +533,7 @@ def phase1_claim_and_plan(repo: str, issue: dict) -> tuple[str, dict] | None:
     title = issue["title"]
     log(f"Phase 1: claiming issue #{num} — {title}")
 
-    username = gh("api", "user", "-q", ".login")
-    gh("api", f"repos/{repo}/issues/{num}/assignees", "-f", f"assignees[]={username}")
+    gh("api", f"repos/{repo}/issues/{num}/assignees", "-f", f"assignees[]={bot_login()}")
     ensure_labels(repo)
 
     issue_body = gh("issue", "view", str(num), "--repo", repo, "--json", "body", "-q", ".body")
@@ -543,6 +558,13 @@ def phase1_claim_and_plan(repo: str, issue: dict) -> tuple[str, dict] | None:
         git("branch", "-D", branch)
     except RuntimeError:
         pass
+    # Also delete any stale remote branch — a prior phase1 may have pushed
+    # before failing, leaving a remote ref that would cause non-fast-forward
+    # rejection when we push the fresh branch built from the default branch.
+    try:
+        git("push", "origin", "--delete", branch)
+    except RuntimeError:
+        pass
     git("checkout", "-b", branch)
     git("commit", "--allow-empty", "-m", f"plan: {title} (#{num})")
     git("push", "-u", "origin", branch)
@@ -564,6 +586,8 @@ def phase1_claim_and_plan(repo: str, issue: dict) -> tuple[str, dict] | None:
 
     pr_url = gh(
         "pr", "create", "--draft", "--repo", repo,
+        "--head", branch,
+        "--base", default_branch,
         "--title", title,
         "--body", plan_body,
     )
