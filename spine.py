@@ -105,10 +105,25 @@ SCHEMA = {
     "branch_pattern": "bot/<issue>-<slug>",
     # Tier path-globs, per repo (fnmatch syntax; `*` crosses slashes, so
     # `dir/**` and `dir/*` both match nested paths — when in doubt, tier A).
-    # Anything not matching A or B is tier C.
+    # Anything not matching A or B is tier C. Curunir's A set was widened
+    # after the spike 0.2 backlog dry-run (dev_stack notes/
+    # backlog-classification.md): src/channels/** is the agent's transport
+    # layer (both [security] path-traversal PRs and the unauthenticated-
+    # listener fix classified C without it); schemas.py/delegate.py are the
+    # tool-parse and delegation critical path; run.py is a fat critical
+    # entrypoint touched by 19 of 53 diffed PRs.
     "tier_globs": {
         "jalemieux/curunir": {
-            "A": ("src/agent/**", "src/llm.py", "src/tools/dispatcher.py", "portal/ws_*"),
+            "A": (
+                "src/agent/**",
+                "src/channels/**",
+                "src/llm.py",
+                "src/tools/dispatcher.py",
+                "src/tools/schemas.py",
+                "src/tools/delegate.py",
+                "run.py",
+                "portal/ws_*",
+            ),
             "B": ("skills/**", "personas/**"),
         },
     },
@@ -118,6 +133,12 @@ WIP_LIMIT = SCHEMA["wip_limit"]
 
 # Strictest first — used to resolve mixed-tier diffs.
 TIERS = ("A", "B", "C")
+
+# Sentinel for an empty diff (the plan-in-PR-body pattern: one empty commit,
+# changedFiles == 0). 56% of the curunir backlog looks like this (spike 0.2);
+# a glob classifier would default it to C and auto-merge an empty commit on
+# green tests, so it must never classify as a mergeable tier.
+PLAN = "PLAN"
 
 
 def legal_transition(old: str, new: str) -> bool:
@@ -131,12 +152,39 @@ def legal_transition(old: str, new: str) -> bool:
     return new in SCHEMA["transitions"].get(old, set())
 
 
-def classify(changed_files: list[str], repo: str) -> str:
+def _is_security_flagged(title: str | None, labels) -> bool:
+    if title and "[security]" in title.lower():
+        return True
+    for label in labels or ():
+        name = label.get("name", "") if isinstance(label, dict) else str(label)
+        if "security" in name.lower():
+            return True
+    return False
+
+
+def classify(
+    changed_files: list[str],
+    repo: str,
+    title: str | None = None,
+    labels: list | None = None,
+) -> str:
     """Classify a diff into a tier by the paths it touches. Pure — no network.
 
-    Mixed-tier diffs take the strictest tier. Repos without configured
-    globs (and files matching nothing) default to tier C.
+    Security override first: '[security]' in the title or a security label
+    forces tier A regardless of globs (spike 0.2 caught three security fixes
+    that would have auto-merged as tier C).
+
+    An EMPTY diff returns the PLAN sentinel, not a tier — plan-only drafts
+    (empty commit, plan in the PR body) must never look auto-mergeable.
+
+    Otherwise mixed-tier diffs take the strictest tier; repos without
+    configured globs (and files matching nothing) default to tier C.
+    `labels` accepts either label-name strings or GitHub {"name": ...} dicts.
     """
+    if _is_security_flagged(title, labels):
+        return "A"
+    if not changed_files:
+        return PLAN
     globs = SCHEMA["tier_globs"].get(repo, {})
     strictest = "C"
     for path in changed_files:

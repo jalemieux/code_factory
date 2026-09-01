@@ -101,8 +101,67 @@ class TestClassify(unittest.TestCase):
     def test_unconfigured_repo_defaults_to_c(self):
         self.assertEqual(spine.classify(["src/llm.py"], "someone/elsewhere"), "C")
 
-    def test_empty_diff_is_tier_c(self):
-        self.assertEqual(spine.classify([], CURUNIR), "C")
+    def test_empty_diff_is_plan_sentinel(self):
+        # 56% of the curunir backlog is empty-diff plan drafts (spike 0.2);
+        # they must never classify as an auto-mergeable tier.
+        self.assertEqual(spine.classify([], CURUNIR), spine.PLAN)
+        self.assertEqual(spine.classify([], "someone/elsewhere"), spine.PLAN)
+        self.assertNotIn(spine.PLAN, spine.TIERS)
+
+    def test_channels_transport_layer_is_tier_a(self):
+        # spike 0.2: security fixes in src/channels/** classified C before.
+        self.assertEqual(spine.classify(["src/channels/ws.py"], CURUNIR), "A")
+        self.assertEqual(spine.classify(["src/channels/email/inbound.py"], CURUNIR), "A")
+
+    def test_tool_schemas_and_delegate_are_tier_a(self):
+        self.assertEqual(spine.classify(["src/tools/schemas.py"], CURUNIR), "A")
+        self.assertEqual(spine.classify(["src/tools/delegate.py"], CURUNIR), "A")
+
+    def test_other_tool_shims_stay_tier_c(self):
+        self.assertEqual(spine.classify(["src/tools/weather.py"], CURUNIR), "C")
+
+    def test_run_py_is_tier_a(self):
+        self.assertEqual(spine.classify(["run.py"], CURUNIR), "A")
+
+
+class TestSecurityOverride(unittest.TestCase):
+    def test_security_title_forces_tier_a_regardless_of_globs(self):
+        self.assertEqual(
+            spine.classify(["README.md"], CURUNIR, title="[security] path traversal fix"),
+            "A",
+        )
+
+    def test_security_title_is_case_insensitive(self):
+        self.assertEqual(
+            spine.classify(["docs/x.md"], CURUNIR, title="[Security] harden rekey"), "A"
+        )
+
+    def test_security_label_dicts_force_tier_a(self):
+        self.assertEqual(
+            spine.classify(["README.md"], CURUNIR, labels=[{"name": "security"}]), "A"
+        )
+
+    def test_security_label_strings_force_tier_a(self):
+        self.assertEqual(
+            spine.classify(["README.md"], CURUNIR, labels=["security-fix"]), "A"
+        )
+
+    def test_override_applies_in_unconfigured_repos(self):
+        self.assertEqual(
+            spine.classify(["x.md"], "someone/elsewhere", title="[security] fix"), "A"
+        )
+
+    def test_override_beats_plan_sentinel(self):
+        # A security-flagged plan draft goes to human review, not the
+        # plan-only bucket — erring on the reviewed side.
+        self.assertEqual(spine.classify([], CURUNIR, title="[security] plan"), "A")
+
+    def test_plain_title_and_labels_do_not_override(self):
+        self.assertEqual(
+            spine.classify(["README.md"], CURUNIR,
+                           title="fix docs", labels=[{"name": "bug"}]),
+            "C",
+        )
 
 
 class TestBranchParsing(unittest.TestCase):
