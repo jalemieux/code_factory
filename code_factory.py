@@ -7,23 +7,38 @@ import argparse
 import json
 import os
 import re
-import shlex
 import subprocess
-import sys
 import tempfile
 import time
-from datetime import datetime
-from functools import lru_cache
 from pathlib import Path
+
+# GitHub state-machine primitives live in spine (see agentic-stack-v2.md);
+# this file keeps the phase logic and drives them.
+from spine import (
+    PHASE2_MARKER,
+    _fmt_argv,
+    _issue_num_from_branch,
+    add_in_progress,
+    add_label,
+    bot_login,
+    check_accepted_plans,
+    check_plan_feedback,
+    check_review_requested,
+    check_unclaimed_issues,
+    ensure_labels,
+    get_in_progress_prs,
+    get_repo,
+    gh,
+    gh_json,
+    log,
+    remove_in_progress,
+    slugify,
+    swap_label,
+)
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 ENV_FILE = Path(__file__).parent / ".env"
 AGENT_CLI = "claude"
-PHASE2_MARKER = "<!-- code-factory:phase2-processed -->"
-
-
-def log(msg: str) -> None:
-    print(f"{datetime.now():%Y-%m-%d %H:%M:%S} — {msg}", file=sys.stderr)
 
 
 def load_env(path: Path = ENV_FILE) -> None:
@@ -60,55 +75,6 @@ def load_env(path: Path = ENV_FILE) -> None:
     ):
         if src in os.environ and dst not in os.environ:
             os.environ[dst] = os.environ[src]
-
-
-def _fmt_argv(prog: str, args: tuple[str, ...]) -> str:
-    parts = [prog]
-    for a in args:
-        if "\n" in a or len(a) > 120:
-            parts.append(f"<{len(a)}-char arg>")
-        else:
-            parts.append(shlex.quote(a))
-    return " ".join(parts)
-
-
-def gh(*args: str) -> str:
-    """Run a gh CLI command and return stdout, retrying on rate limits and transient server errors."""
-    for attempt in range(4):
-        result = subprocess.run(
-            ["gh", *args], capture_output=True, text=True
-        )
-        if result.returncode == 0:
-            return result.stdout.strip()
-        stderr_lower = result.stderr.lower()
-        transient = (
-            "rate limit" in stderr_lower
-            or re.search(r"http 5\d\d", stderr_lower)
-            or "gateway timeout" in stderr_lower
-            or "timeout" in stderr_lower
-            or "temporarily unavailable" in stderr_lower
-            or "connection reset" in stderr_lower
-        )
-        if transient and attempt < 3:
-            wait = 2 ** attempt * 15
-            log(f"Transient gh error, retrying in {wait}s: {result.stderr.strip()[:120]}")
-            time.sleep(wait)
-            continue
-        detail = result.stderr.strip() or result.stdout.strip() or "<no output>"
-        raise RuntimeError(
-            f"{_fmt_argv('gh', args)} (exit {result.returncode}): {detail}"
-        )
-    return ""
-
-
-def gh_json(*args: str) -> list | dict:
-    return json.loads(gh(*args) or "[]")
-
-
-@lru_cache(maxsize=1)
-def bot_login() -> str:
-    """The gh login this bot authenticates as. Cached — it can't change mid-run."""
-    return gh("api", "user", "-q", ".login")
 
 
 def fetch_review_payload(repo: str, num: int) -> str:
@@ -172,10 +138,6 @@ def git(*args: str) -> str:
     return result.stdout.strip()
 
 
-def slugify(title: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", title.lower())[:40].strip("-")
-
-
 def _strip_outer_fence(text: str) -> str:
     """If `text` is fully wrapped in a markdown code fence, remove it."""
     stripped = text.strip()
@@ -189,70 +151,6 @@ def _strip_outer_fence(text: str) -> str:
     if "```" in inner:
         return stripped
     return inner
-
-
-def _issue_num_from_branch(branch: str) -> int | None:
-    """Branches created by phase1 are `bot/<num>-<slug>` — extract <num>."""
-    m = re.match(r"^bot/(\d+)-", branch or "")
-    return int(m.group(1)) if m else None
-
-
-def ensure_labels(repo: str) -> None:
-    for label in (
-        "bot:plan-proposed",
-        "bot:plan-accepted",
-        "bot:in-progress",
-        "bot:review-requested",
-    ):
-        gh(
-            "label", "create", label,
-            "--repo", repo,
-            "--description", "Managed by git-contribute",
-            "--color", "0E8A16",
-            "--force",
-        )
-
-
-def add_label(repo: str, num: int, label: str) -> None:
-    gh("api", f"repos/{repo}/issues/{num}/labels", "-f", f"labels[]={label}")
-
-
-def remove_label(repo: str, num: int, label: str) -> None:
-    try:
-        gh("api", f"repos/{repo}/issues/{num}/labels/{label}", "-X", "DELETE")
-    except RuntimeError:
-        pass
-
-
-def add_in_progress(repo: str, num: int) -> None:
-    add_label(repo, num, "bot:in-progress")
-
-
-def remove_in_progress(repo: str, num: int) -> None:
-    remove_label(repo, num, "bot:in-progress")
-
-
-def swap_label(repo: str, num: int, old: str, new: str) -> None:
-    remove_label(repo, num, old)
-    add_label(repo, num, new)
-
-
-def get_repo(repo: str | None = None) -> str:
-    if repo:
-        return repo
-    return gh("repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner")
-
-
-def _has_label(pr: dict, name: str) -> bool:
-    """Authoritative check for label presence.
-
-    `gh pr list --label X` queries the search index, which is eventually
-    consistent — when labels flip rapidly it returns PRs whose actual
-    labels no longer include X. The labels embedded in `--json labels`
-    come from the PR detail API and reflect current state, so we
-    re-verify before trusting a search hit.
-    """
-    return any(l.get("name") == name for l in pr.get("labels", []))
 
 
 def read_repo_conventions(repo: str) -> str:
@@ -317,165 +215,6 @@ def llm_interactive(prompt: str, workdir: str) -> str:
         ["claude", "--dangerously-skip-permissions", "-p", prompt, "--print"],
         cwd=workdir,
     )
-
-
-def get_in_progress_prs(repo: str) -> set[int]:
-    prs = gh_json(
-        "pr", "list", "--repo", repo,
-        "--label", "bot:in-progress",
-        "--json", "number,labels",
-    )
-    return {pr["number"] for pr in prs if _has_label(pr, "bot:in-progress")}
-
-
-def check_review_requested(repo: str) -> list[dict]:
-    """Priority 1: PRs with code review feedback.
-
-    Authorship is intentionally not filtered — a `bot:*` label is the opt-in
-    signal that the bot should act on a PR, regardless of who opened it. This
-    lets a human author a plan PR by hand and hand it off by labeling.
-    """
-    prs = gh_json(
-        "pr", "list", "--repo", repo,
-        "--label", "bot:review-requested",
-        "--json", "number,title,updatedAt,labels",
-    )
-    actionable = []
-    for pr in prs:
-        if not _has_label(pr, "bot:review-requested"):
-            continue
-        info = gh_json(
-            "pr", "view", str(pr["number"]), "--repo", repo,
-            "--json", "reviews,commits",
-            "--jq",
-            "{last_review: .reviews[-1].submittedAt, last_commit: .commits[-1].committedDate}",
-        )
-        last_review = info.get("last_review")
-        last_commit = info.get("last_commit")
-        if last_review and last_commit and last_review > last_commit:
-            actionable.append(pr)
-    return actionable
-
-
-def check_plan_feedback(repo: str) -> list[dict]:
-    """Priority 2: Plan PRs with feedback (on the PR or the linked issue).
-
-    The `bot:plan-proposed` label is the source of truth — we don't also gate
-    on `--draft`, because a prior partial run or a manual "ready for review"
-    click can flip draft state without changing the label, which would
-    otherwise strand the PR with unprocessed feedback.
-
-    Bot vs. human comments are distinguished by the PHASE2_MARKER, not by
-    `author.login` — when the bot runs as the human user (same gh account),
-    every comment shares the same login, so the marker is the only reliable
-    signal that a comment came from the bot.
-    """
-    prs = gh_json(
-        "pr", "list", "--repo", repo,
-        "--label", "bot:plan-proposed",
-        "--json", "number,title,headRefName,labels",
-    )
-    actionable = []
-    for pr in prs:
-        if not _has_label(pr, "bot:plan-proposed"):
-            continue
-        # `gh ... --json comments` returns {"comments": [...]} — unwrap to the list.
-        pr_payload = gh_json(
-            "pr", "view", str(pr["number"]), "--repo", repo,
-            "--json", "comments",
-        )
-        pr_comments = pr_payload.get("comments", []) if isinstance(pr_payload, dict) else []
-
-        issue_num = _issue_num_from_branch(pr.get("headRefName", ""))
-        issue_comments = []
-        if issue_num:
-            try:
-                issue_payload = gh_json(
-                    "issue", "view", str(issue_num), "--repo", repo,
-                    "--json", "comments",
-                )
-                issue_comments = issue_payload.get("comments", []) if isinstance(issue_payload, dict) else []
-            except RuntimeError:
-                issue_comments = []
-
-        latest_human = None
-        latest_marker = None
-        for comment in [*pr_comments, *issue_comments]:
-            created_at = comment.get("createdAt")
-            body = comment.get("body") or ""
-            if not created_at:
-                continue
-            if PHASE2_MARKER in body:
-                if latest_marker is None or created_at > latest_marker:
-                    latest_marker = created_at
-                continue
-            if latest_human is None or created_at > latest_human:
-                latest_human = created_at
-
-        if latest_human and (latest_marker is None or latest_human > latest_marker):
-            pr["issue_number"] = issue_num
-            actionable.append(pr)
-    return actionable
-
-
-def check_accepted_plans(repo: str) -> list[dict]:
-    """Priority 3: Accepted plans ready for implementation."""
-    prs = gh_json(
-        "pr", "list", "--repo", repo,
-        "--label", "bot:plan-accepted",
-        "--json", "number,title,labels",
-    )
-    return [pr for pr in prs if _has_label(pr, "bot:plan-accepted")]
-
-
-def check_unclaimed_issues(repo: str) -> list[dict]:
-    """Priority 4: Open issues claimable by this bot with no existing plan PR.
-
-    "Linked" = there's an open PR on a branch named `bot/<N>-*`. We don't use
-    `--search "#N"` because GitHub does a fuzzy substring match across all PR
-    text, so an unrelated PR mentioning "#65" anywhere in its body would mask a
-    genuinely unclaimed issue.
-
-    A self-assignment is not a blocker: phase 1 self-assigns the issue before
-    opening the plan PR (so the bot can flag intent), and a crash between those
-    two steps would otherwise strand the issue — assigned-to-self but with no
-    PR, invisible to both the assignee filter and the branch dedup. We skip
-    only issues assigned to *someone else*, which is a human claiming the work.
-    """
-    issues = gh_json(
-        "issue", "list", "--repo", repo,
-        "--state", "open",
-        "--json", "number,title,labels,assignees",
-        "--limit", "20",
-    )
-    open_bot_prs = gh_json(
-        "pr", "list", "--repo", repo,
-        "--state", "open",
-        "--json", "headRefName",
-        "--limit", "100",
-    )
-    claimed_nums = set()
-    for pr in open_bot_prs:
-        n = _issue_num_from_branch(pr.get("headRefName", ""))
-        if n is not None:
-            claimed_nums.add(n)
-
-    me = bot_login()
-    actionable = []
-    for issue in issues:
-        others = [a for a in issue.get("assignees", []) if a.get("login") != me]
-        if others:
-            continue
-        if issue["number"] in claimed_nums:
-            continue
-        actionable.append(issue)
-    # Prefer issues with good-first-issue or help-wanted labels
-    preferred = {"good first issue", "good-first-issue", "help wanted", "help-wanted"}
-    def sort_key(issue: dict) -> int:
-        labels = {l["name"].lower() for l in issue.get("labels", [])}
-        return 0 if labels & preferred else 1
-    actionable.sort(key=sort_key)
-    return actionable
 
 
 def route(repo: str) -> tuple[str, dict] | None:

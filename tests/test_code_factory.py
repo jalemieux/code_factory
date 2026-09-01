@@ -9,7 +9,7 @@ import code_factory
 
 
 class TestGh(unittest.TestCase):
-    @patch("code_factory.subprocess.run")
+    @patch("spine.subprocess.run")
     def test_gh_returns_stdout_on_success(self, mock_run):
         mock_run.return_value = MagicMock(returncode=0, stdout="  output\n", stderr="")
         result = code_factory.gh("repo", "view")
@@ -18,15 +18,15 @@ class TestGh(unittest.TestCase):
             ["gh", "repo", "view"], capture_output=True, text=True
         )
 
-    @patch("code_factory.subprocess.run")
+    @patch("spine.subprocess.run")
     def test_gh_raises_on_non_rate_limit_error(self, mock_run):
         mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="not found")
         with self.assertRaises(RuntimeError) as ctx:
             code_factory.gh("repo", "view")
         self.assertIn("not found", str(ctx.exception))
 
-    @patch("code_factory.time.sleep")
-    @patch("code_factory.subprocess.run")
+    @patch("spine.time.sleep")
+    @patch("spine.subprocess.run")
     def test_gh_retries_on_rate_limit(self, mock_run, mock_sleep):
         fail = MagicMock(returncode=1, stdout="", stderr="API rate limit exceeded")
         success = MagicMock(returncode=0, stdout="ok", stderr="")
@@ -38,13 +38,13 @@ class TestGh(unittest.TestCase):
 
 
 class TestGhJson(unittest.TestCase):
-    @patch("code_factory.gh")
+    @patch("spine.gh")
     def test_gh_json_parses_list(self, mock_gh):
         mock_gh.return_value = '[{"number": 1}]'
         result = code_factory.gh_json("pr", "list")
         self.assertEqual(result, [{"number": 1}])
 
-    @patch("code_factory.gh")
+    @patch("spine.gh")
     def test_gh_json_returns_empty_list_for_empty_string(self, mock_gh):
         mock_gh.return_value = ""
         result = code_factory.gh_json("pr", "list")
@@ -137,7 +137,7 @@ class TestLoadPrompt(unittest.TestCase):
 
 
 class TestCheckReviewRequested(unittest.TestCase):
-    @patch("code_factory.gh_json")
+    @patch("spine.gh_json")
     def test_returns_pr_when_review_newer_than_commit(self, mock_gh_json):
         mock_gh_json.side_effect = [
             [{"number": 5, "title": "Fix", "updatedAt": "2026-01-01",
@@ -151,7 +151,7 @@ class TestCheckReviewRequested(unittest.TestCase):
               "labels": [{"name": "bot:review-requested"}]}],
         )
 
-    @patch("code_factory.gh_json")
+    @patch("spine.gh_json")
     def test_skips_pr_when_commit_newer_than_review(self, mock_gh_json):
         mock_gh_json.side_effect = [
             [{"number": 5, "title": "Fix", "updatedAt": "2026-01-01",
@@ -161,7 +161,7 @@ class TestCheckReviewRequested(unittest.TestCase):
         result = code_factory.check_review_requested("owner/repo")
         self.assertEqual(result, [])
 
-    @patch("code_factory.gh_json")
+    @patch("spine.gh_json")
     def test_skips_pr_when_search_index_is_stale(self, mock_gh_json):
         # gh's label search is eventually consistent — it can return a PR whose
         # actual labels no longer include the filter. Don't trust the search.
@@ -175,7 +175,7 @@ class TestCheckReviewRequested(unittest.TestCase):
 
 class TestCheckPlanFeedback(unittest.TestCase):
     # `gh ... --json comments` returns {"comments": [...]}, not a bare list — match real shape.
-    @patch("code_factory.gh_json")
+    @patch("spine.gh_json")
     def test_returns_pr_when_human_comment_has_no_marker(self, mock_gh_json):
         mock_gh_json.side_effect = [
             [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix",
@@ -190,7 +190,7 @@ class TestCheckPlanFeedback(unittest.TestCase):
               "labels": [{"name": "bot:plan-proposed"}], "issue_number": 42}],
         )
 
-    @patch("code_factory.gh_json")
+    @patch("spine.gh_json")
     def test_skips_pr_when_marker_is_newer_than_human_comment(self, mock_gh_json):
         mock_gh_json.side_effect = [
             [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix",
@@ -204,7 +204,7 @@ class TestCheckPlanFeedback(unittest.TestCase):
         result = code_factory.check_plan_feedback("owner/repo")
         self.assertEqual(result, [])
 
-    @patch("code_factory.gh_json")
+    @patch("spine.gh_json")
     def test_returns_pr_when_issue_comment_is_newer_than_marker(self, mock_gh_json):
         mock_gh_json.side_effect = [
             [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix",
@@ -219,7 +219,7 @@ class TestCheckPlanFeedback(unittest.TestCase):
               "labels": [{"name": "bot:plan-proposed"}], "issue_number": 42}],
         )
 
-    @patch("code_factory.gh_json")
+    @patch("spine.gh_json")
     def test_human_comments_detected_when_bot_shares_user_account(self, mock_gh_json):
         # Bot runs as the human user, so author.login is identical for both.
         # The marker — not the login — is what distinguishes bot from human.
@@ -239,7 +239,7 @@ class TestCheckPlanFeedback(unittest.TestCase):
               "labels": [{"name": "bot:plan-proposed"}], "issue_number": 42}],
         )
 
-    @patch("code_factory.gh_json")
+    @patch("spine.gh_json")
     def test_skips_pr_when_search_index_is_stale(self, mock_gh_json):
         # Reproduces the loop bug: gh's label search returned a PR whose actual
         # labels are review-requested + in-progress (no plan-proposed). Without
@@ -252,9 +252,9 @@ class TestCheckPlanFeedback(unittest.TestCase):
         self.assertEqual(result, [])
 
 
-@patch("code_factory.bot_login", return_value="botuser")
+@patch("spine.bot_login", return_value="botuser")
 class TestCheckUnclaimed(unittest.TestCase):
-    @patch("code_factory.gh_json")
+    @patch("spine.gh_json")
     def test_skips_assigned_issues(self, mock_gh_json, _mock_login):
         mock_gh_json.return_value = [
             {"number": 1, "title": "Bug", "labels": [], "assignees": [{"login": "bob"}]},
@@ -262,7 +262,7 @@ class TestCheckUnclaimed(unittest.TestCase):
         result = code_factory.check_unclaimed_issues("owner/repo")
         self.assertEqual(result, [])
 
-    @patch("code_factory.gh_json")
+    @patch("spine.gh_json")
     def test_picks_up_self_assigned_issue(self, mock_gh_json, _mock_login):
         # Issue assigned only to the bot itself (e.g. a crashed prior claim with
         # no plan PR) must still be picked up, not treated as claimed by another.
@@ -273,7 +273,7 @@ class TestCheckUnclaimed(unittest.TestCase):
         result = code_factory.check_unclaimed_issues("owner/repo")
         self.assertEqual(result[0]["number"], 1)
 
-    @patch("code_factory.gh_json")
+    @patch("spine.gh_json")
     def test_skips_issue_assigned_to_bot_and_human(self, mock_gh_json, _mock_login):
         # A human assignee alongside the bot still means a human owns it.
         mock_gh_json.return_value = [
@@ -283,7 +283,7 @@ class TestCheckUnclaimed(unittest.TestCase):
         result = code_factory.check_unclaimed_issues("owner/repo")
         self.assertEqual(result, [])
 
-    @patch("code_factory.gh_json")
+    @patch("spine.gh_json")
     def test_skips_issues_with_open_prs(self, mock_gh_json, _mock_login):
         mock_gh_json.side_effect = [
             [{"number": 1, "title": "Bug", "labels": [], "assignees": []}],
@@ -292,7 +292,7 @@ class TestCheckUnclaimed(unittest.TestCase):
         result = code_factory.check_unclaimed_issues("owner/repo")
         self.assertEqual(result, [])
 
-    @patch("code_factory.gh_json")
+    @patch("spine.gh_json")
     def test_returns_unassigned_issue_with_no_prs(self, mock_gh_json, _mock_login):
         mock_gh_json.side_effect = [
             [{"number": 1, "title": "Bug", "labels": [], "assignees": []}],
