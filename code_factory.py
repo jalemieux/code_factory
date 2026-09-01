@@ -8,6 +8,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -733,22 +734,108 @@ def bootstrap_repo(repo: str, sync: bool = True) -> None:
         log(f"Cloned and entered {repo}")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Code Factory — autonomous GitHub contributions")
-    parser.add_argument("agent", nargs="?", choices=("claude", "codex"), help="agent CLI to use")
-    parser.add_argument("--agent", dest="agent_flag", choices=("claude", "codex"), help="agent CLI to use")
-    parser.add_argument("--repo", help="owner/repo (default: current repo)")
-    parser.add_argument("--once", action="store_true", help="single pass, then exit")
-    args = parser.parse_args()
-    agent = args.agent_flag or args.agent or "claude"
+# Accepted spellings for `run --phase`: bare number, phaseN, or full name.
+RUN_PHASE_ALIASES: dict[str, str] = {}
+for _name in PHASES:
+    _num = _name.split("_", 1)[0].removeprefix("phase")
+    RUN_PHASE_ALIASES[_name] = _name
+    RUN_PHASE_ALIASES[_num] = _name
+    RUN_PHASE_ALIASES[f"phase{_num}"] = _name
 
-    global AGENT_CLI
-    AGENT_CLI = agent
 
-    load_env()
-    if "GH_TOKEN" in os.environ:
-        log(f"Using GH_TOKEN from {ENV_FILE.name}")
+def run_chain(start: tuple[str, dict]) -> bool:
+    """Execute one phase chain to completion. Returns True on success."""
+    phase_name, ctx = start
+    try:
+        next_result = start
+        while next_result:
+            phase_name, ctx = next_result
+            phase_fn = PHASES[phase_name]
+            next_result = phase_fn(**ctx)
+        return True
+    except Exception as e:
+        log(f"Error in {phase_name}: {e}")
+        pr = ctx.get("pr")
+        if pr:
+            try:
+                remove_in_progress(ctx["repo"], pr["number"])
+            except Exception:
+                pass
+        return False
 
+
+def build_parser() -> argparse.ArgumentParser:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--repo", help="owner/repo (default: current repo)")
+    common.add_argument("--agent", choices=("claude", "codex"), help="agent CLI to use (default: claude)")
+
+    parser = argparse.ArgumentParser(
+        description="Code Factory — autonomous GitHub contributions",
+        parents=[common],
+    )
+    parser.add_argument(
+        "--loop", action="store_true",
+        help="[DEPRECATED] run the polling loop that routes and executes work "
+             "until interrupted; superseded by dispatcher-driven `run` invocations",
+    )
+    parser.add_argument("--once", action="store_true", help="with --loop: single poll pass, then exit")
+
+    sub = parser.add_subparsers(dest="command")
+    run_p = sub.add_parser(
+        "run", parents=[common],
+        help="execute exactly one phase chain, then exit (nonzero on failure)",
+        description="Execute exactly one unit of work: a phase chain for one "
+                    "PR (--pr N --phase X) or the plan phase for one issue "
+                    "(--issue N). Exits 0 on success, 1 on failure.",
+    )
+    unit = run_p.add_mutually_exclusive_group(required=True)
+    unit.add_argument("--pr", type=int, metavar="N", help="PR number to act on")
+    unit.add_argument("--issue", type=int, metavar="N", help="issue number to plan (phase 1)")
+    run_p.add_argument(
+        "--phase", metavar="X",
+        help="phase to run for --pr: 2|4|5|6, phaseN, or the full name "
+             "(e.g. phase4_implement); required with --pr",
+    )
+    return parser
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    repo = get_repo(args.repo)
+    log(f"Code Factory run: {repo} (agent: {AGENT_CLI})")
+    # sync=False: locate the clone only. `run` must not move the main
+    # clone's checkout — phases fetch exactly what they need.
+    bootstrap_repo(repo, sync=False)
+
+    if args.issue is not None:
+        if args.phase and RUN_PHASE_ALIASES.get(args.phase) != "phase1_claim_and_plan":
+            log("--issue always runs phase 1; --phase is only valid with --pr")
+            return 2
+        issue = gh_json(
+            "issue", "view", str(args.issue), "--repo", repo,
+            "--json", "number,title",
+        )
+        start = ("phase1_claim_and_plan", {"repo": repo, "issue": issue})
+    else:
+        if not args.phase:
+            log("--phase is required with --pr")
+            return 2
+        phase_name = RUN_PHASE_ALIASES.get(args.phase)
+        if phase_name is None or phase_name == "phase1_claim_and_plan":
+            valid = ", ".join(sorted(n for n in PHASES if n != "phase1_claim_and_plan"))
+            log(f"Unknown phase {args.phase!r} for --pr; valid: {valid}")
+            return 2
+        pr = gh_json(
+            "pr", "view", str(args.pr), "--repo", repo,
+            "--json", "number,title,headRefName",
+        )
+        start = (phase_name, {"repo": repo, "pr": pr})
+
+    ok = run_chain(start)
+    return 0 if ok else 1
+
+
+def cmd_loop(args: argparse.Namespace) -> int:
+    """[DEPRECATED] Legacy polling loop — poll, route, execute, repeat."""
     repo = get_repo(args.repo)
     log(f"Code Factory targeting: {repo} (agent: {AGENT_CLI})")
     bootstrap_repo(repo)
@@ -758,22 +845,9 @@ def main() -> None:
         result = route(repo)
 
         if result:
-            phase_name, ctx = result
+            phase_name, _ = result
             log(f"Work found — starting {phase_name}")
-            try:
-                next_result = result
-                while next_result:
-                    phase_name, ctx = next_result
-                    phase_fn = PHASES[phase_name]
-                    next_result = phase_fn(**ctx)
-            except Exception as e:
-                log(f"Error in {phase_name}: {e}")
-                pr = ctx.get("pr")
-                if pr:
-                    try:
-                        remove_in_progress(repo, pr["number"])
-                    except Exception:
-                        pass
+            run_chain(result)
         else:
             log("No actionable work found.")
 
@@ -783,6 +857,28 @@ def main() -> None:
         sleep_time = 5 if result else 300
         log(f"Sleeping {sleep_time} seconds...")
         time.sleep(sleep_time)
+    return 0
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+
+    global AGENT_CLI
+    AGENT_CLI = args.agent or "claude"
+
+    load_env()
+    if "GH_TOKEN" in os.environ:
+        log(f"Using GH_TOKEN from {ENV_FILE.name}")
+
+    if args.command == "run":
+        sys.exit(cmd_run(args))
+
+    # No subcommand: the legacy polling loop, kept until the dispatcher
+    # (plane 2) replaces it. Explicit --loop is preferred over the bare
+    # invocation, which stays only for compatibility.
+    if not args.loop:
+        log("DEPRECATED: implicit polling loop — use `run --pr/--issue` per unit, or pass --loop explicitly.")
+    sys.exit(cmd_loop(args))
 
 
 if __name__ == "__main__":

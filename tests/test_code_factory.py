@@ -507,51 +507,127 @@ class TestAgentSelection(unittest.TestCase):
 
 
 class TestMain(unittest.TestCase):
+    @patch("code_factory.load_env")
     @patch("code_factory.bootstrap_repo")
     @patch("code_factory.time.sleep")
     @patch("code_factory.route", return_value=None)
     @patch("code_factory.get_repo", return_value="owner/repo")
-    def test_once_mode_exits_when_no_work(self, mock_repo, mock_route, mock_sleep, mock_bootstrap):
-        with patch("sys.argv", ["code_factory.py", "--once"]):
-            code_factory.main()
+    def test_once_mode_exits_when_no_work(self, mock_repo, mock_route, mock_sleep, mock_bootstrap, _env):
+        with patch("sys.argv", ["code_factory.py", "--loop", "--once"]):
+            with self.assertRaises(SystemExit) as ctx:
+                code_factory.main()
+        self.assertEqual(ctx.exception.code, 0)
         mock_route.assert_called_once_with("owner/repo")
         mock_sleep.assert_not_called()
 
+    @patch("code_factory.load_env")
     @patch("code_factory.bootstrap_repo")
     @patch("code_factory.route", return_value=None)
     @patch("code_factory.get_repo", return_value="owner/repo")
-    def test_agent_positional_argument_selects_codex(self, mock_repo, mock_route, mock_bootstrap):
+    def test_agent_flag_selects_codex(self, mock_repo, mock_route, mock_bootstrap, _env):
         original = code_factory.AGENT_CLI
         try:
-            with patch("sys.argv", ["code_factory.py", "codex", "--once"]):
-                code_factory.main()
+            with patch("sys.argv", ["code_factory.py", "--agent", "codex", "--loop", "--once"]):
+                with self.assertRaises(SystemExit):
+                    code_factory.main()
             self.assertEqual(code_factory.AGENT_CLI, "codex")
         finally:
             code_factory.AGENT_CLI = original
 
+    @patch("code_factory.load_env")
     @patch("code_factory.bootstrap_repo")
     @patch("code_factory.time.sleep")
     @patch("code_factory.remove_in_progress")
     @patch("code_factory.route")
     @patch("code_factory.get_repo", return_value="owner/repo")
-    def test_once_mode_runs_phase_and_exits(self, mock_repo, mock_route, mock_remove, mock_sleep, mock_bootstrap):
+    def test_once_mode_runs_phase_and_exits(self, mock_repo, mock_route, mock_remove, mock_sleep, mock_bootstrap, _env):
         phase_fn = MagicMock(return_value=None)
         mock_route.return_value = ("test_phase", {"repo": "owner/repo", "pr": {"number": 1}})
         with patch("sys.argv", ["code_factory.py", "--once"]):
             with patch.dict(code_factory.PHASES, {"test_phase": phase_fn}):
-                code_factory.main()
+                with self.assertRaises(SystemExit):
+                    code_factory.main()
         phase_fn.assert_called_once()
 
+    @patch("code_factory.load_env")
     @patch("code_factory.bootstrap_repo")
     @patch("code_factory.time.sleep")
     @patch("code_factory.remove_in_progress")
     @patch("code_factory.route")
     @patch("code_factory.get_repo", return_value="owner/repo")
-    def test_error_cleans_up_in_progress(self, mock_repo, mock_route, mock_remove, mock_sleep, mock_bootstrap):
+    def test_error_cleans_up_in_progress(self, mock_repo, mock_route, mock_remove, mock_sleep, mock_bootstrap, _env):
         def failing_phase(**ctx):
             raise RuntimeError("boom")
         mock_route.return_value = ("test_phase", {"repo": "owner/repo", "pr": {"number": 7}})
         with patch("sys.argv", ["code_factory.py", "--once"]):
             with patch.dict(code_factory.PHASES, {"test_phase": failing_phase}):
-                code_factory.main()
+                with self.assertRaises(SystemExit):
+                    code_factory.main()
         mock_remove.assert_called_once_with("owner/repo", 7)
+
+
+class TestRunSubcommand(unittest.TestCase):
+    def _args(self, argv):
+        return code_factory.build_parser().parse_args(argv)
+
+    @patch("code_factory.gh_json")
+    @patch("code_factory.bootstrap_repo")
+    @patch("code_factory.get_repo", return_value="owner/repo")
+    def test_run_pr_phase_executes_chain_and_returns_zero(self, mock_repo, mock_bootstrap, mock_gh_json):
+        mock_gh_json.return_value = {"number": 5, "title": "Fix", "headRefName": "bot/2-fix"}
+        phase_fn = MagicMock(return_value=None)
+        with patch.dict(code_factory.PHASES, {"phase4_implement": phase_fn}):
+            rc = code_factory.cmd_run(self._args(["run", "--pr", "5", "--phase", "4"]))
+        self.assertEqual(rc, 0)
+        phase_fn.assert_called_once_with(
+            repo="owner/repo", pr={"number": 5, "title": "Fix", "headRefName": "bot/2-fix"}
+        )
+        mock_bootstrap.assert_called_once_with("owner/repo", sync=False)
+
+    @patch("code_factory.gh_json")
+    @patch("code_factory.bootstrap_repo")
+    @patch("code_factory.get_repo", return_value="owner/repo")
+    def test_run_pr_failure_returns_nonzero(self, mock_repo, mock_bootstrap, mock_gh_json):
+        mock_gh_json.return_value = {"number": 5, "title": "Fix", "headRefName": "bot/2-fix"}
+        def failing_phase(**ctx):
+            raise RuntimeError("boom")
+        with patch("code_factory.remove_in_progress"):
+            with patch.dict(code_factory.PHASES, {"phase6_process_review": failing_phase}):
+                rc = code_factory.cmd_run(self._args(["run", "--pr", "5", "--phase", "phase6"]))
+        self.assertEqual(rc, 1)
+
+    @patch("code_factory.gh_json")
+    @patch("code_factory.bootstrap_repo")
+    @patch("code_factory.get_repo", return_value="owner/repo")
+    def test_run_issue_executes_phase1(self, mock_repo, mock_bootstrap, mock_gh_json):
+        mock_gh_json.return_value = {"number": 12, "title": "New feature"}
+        phase_fn = MagicMock(return_value=None)
+        with patch.dict(code_factory.PHASES, {"phase1_claim_and_plan": phase_fn}):
+            rc = code_factory.cmd_run(self._args(["run", "--issue", "12"]))
+        self.assertEqual(rc, 0)
+        phase_fn.assert_called_once_with(repo="owner/repo", issue={"number": 12, "title": "New feature"})
+
+    @patch("code_factory.bootstrap_repo")
+    @patch("code_factory.get_repo", return_value="owner/repo")
+    def test_run_pr_without_phase_is_an_error(self, mock_repo, mock_bootstrap):
+        rc = code_factory.cmd_run(self._args(["run", "--pr", "5"]))
+        self.assertEqual(rc, 2)
+
+    @patch("code_factory.bootstrap_repo")
+    @patch("code_factory.get_repo", return_value="owner/repo")
+    def test_run_pr_with_unknown_phase_is_an_error(self, mock_repo, mock_bootstrap):
+        rc = code_factory.cmd_run(self._args(["run", "--pr", "5", "--phase", "nonsense"]))
+        self.assertEqual(rc, 2)
+
+    def test_run_requires_exactly_one_of_pr_or_issue(self):
+        with self.assertRaises(SystemExit):
+            self._args(["run"])
+        with self.assertRaises(SystemExit):
+            self._args(["run", "--pr", "5", "--issue", "3"])
+
+    def test_phase_aliases_resolve(self):
+        self.assertEqual(code_factory.RUN_PHASE_ALIASES["4"], "phase4_implement")
+        self.assertEqual(code_factory.RUN_PHASE_ALIASES["phase6"], "phase6_process_review")
+        self.assertEqual(
+            code_factory.RUN_PHASE_ALIASES["phase2_process_feedback"], "phase2_process_feedback"
+        )
