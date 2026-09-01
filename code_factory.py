@@ -152,6 +152,133 @@ def git(*args: str, cwd: str | None = None) -> str:
     return result.stdout.strip()
 
 
+def git_retry(*args: str, cwd: str | None = None, attempts: int = 3, delay: float = 0.3) -> str:
+    """git() with a short retry for shared-state lock contention.
+
+    Sibling worktrees share one `.git` — concurrent commands that write
+    shared files (`config`, worktree bookkeeping, packed-refs) can collide
+    on a `.lock` (observed in spike 0.1 on concurrent `push -u`). Three
+    attempts with a short sleep is enough; anything else re-raises.
+    """
+    last_error: RuntimeError | None = None
+    for attempt in range(attempts):
+        try:
+            return git(*args, cwd=cwd)
+        except RuntimeError as e:
+            message = str(e).lower()
+            retryable = "could not lock" in message or "unable to lock" in message or ".lock" in message
+            if not retryable or attempt == attempts - 1:
+                raise
+            last_error = e
+            log(f"git lock contention, retrying in {delay}s: {e}")
+            time.sleep(delay)
+    raise last_error  # unreachable, but keeps the type checker honest
+
+
+class WorktreeCleanupRefused(RuntimeError):
+    """Worktree cleanup declined to destroy state (dirty tree or unpushed work).
+
+    Everything is left in place; the caller decides what to do (phases mark
+    the PR `bot:failed` with an explanatory comment).
+    """
+
+
+class Worktree:
+    """A git worktree for exactly one unit of work.
+
+    Enter: `git worktree prune` (clears stale entries from crashed workers),
+    then `git worktree add` under `<repo_root>/.worktrees/` on <branch>,
+    creating the branch from `origin/<branch>` (or HEAD) if needed.
+
+    Exit: hard-gated cleanup per spike 0.1 (dev_stack notes/spike-01):
+    `worktree remove` alone is recoverable (the branch ref survives in the
+    shared clone) — the destroyer is the follow-up `git branch -D`. So:
+
+      - dirty tree        → refuse removal; NEVER pass `--force`.
+      - unpushed commits  → refuse `branch -D`. Measured by
+        `rev-list --count @{upstream}..HEAD`, falling back to
+        `origin/<branch>..HEAD`; "no upstream and no remote ref" is
+        treated as unpushed.
+
+    On refusal everything stays in place and WorktreeCleanupRefused is
+    raised. If the body itself raised, no cleanup is attempted (the
+    worktree is left for inspection) and the original exception propagates.
+    """
+
+    def __init__(self, repo_root: str, branch: str):
+        self.repo_root = os.path.abspath(repo_root)
+        self.branch = branch
+        self.path = os.path.join(self.repo_root, ".worktrees", branch.replace("/", "-"))
+
+    def _ref_exists(self, ref: str) -> bool:
+        try:
+            git("rev-parse", "--verify", "--quiet", ref, cwd=self.repo_root)
+            return True
+        except RuntimeError:
+            return False
+
+    def __enter__(self) -> "Worktree":
+        git_retry("worktree", "prune", cwd=self.repo_root)
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        if self._ref_exists(f"refs/heads/{self.branch}"):
+            git_retry("worktree", "add", self.path, self.branch, cwd=self.repo_root)
+        elif self._ref_exists(f"refs/remotes/origin/{self.branch}"):
+            git_retry(
+                "worktree", "add", "-b", self.branch, self.path,
+                f"origin/{self.branch}", cwd=self.repo_root,
+            )
+        else:
+            git_retry("worktree", "add", "-b", self.branch, self.path, cwd=self.repo_root)
+        return self
+
+    def is_dirty(self) -> bool:
+        return bool(git("status", "--porcelain", cwd=self.path))
+
+    def unpushed_count(self) -> int | None:
+        """Commits on HEAD that the remote doesn't have; None = no remote ref at all."""
+        try:
+            return int(git("rev-list", "--count", "@{upstream}..HEAD", cwd=self.path))
+        except RuntimeError:
+            pass
+        # Workers push with an explicit refspec (no -u), so there's usually no
+        # upstream — but the push still updates refs/remotes/origin/<branch>.
+        try:
+            return int(git("rev-list", "--count", f"origin/{self.branch}..HEAD", cwd=self.path))
+        except RuntimeError:
+            return None
+
+    def cleanup(self) -> None:
+        """Remove the worktree and delete the local branch — gated. May refuse."""
+        if self.is_dirty():
+            raise WorktreeCleanupRefused(
+                f"worktree {self.path} has uncommitted changes; "
+                "refusing removal (and never passing --force)"
+            )
+        unpushed = self.unpushed_count()
+        if unpushed is None or unpushed > 0:
+            reason = (
+                "no upstream/remote ref (treated as unpushed)"
+                if unpushed is None
+                else f"{unpushed} unpushed commit(s)"
+            )
+            raise WorktreeCleanupRefused(
+                f"branch {self.branch} has {reason}; refusing `git branch -D` "
+                f"(worktree left at {self.path})"
+            )
+        git_retry("worktree", "remove", self.path, cwd=self.repo_root)
+        git_retry("branch", "-D", self.branch, cwd=self.repo_root)
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if exc_type is not None:
+            log(
+                f"Worktree {self.path}: leaving worktree and branch in place "
+                f"after {exc_type.__name__}"
+            )
+            return False
+        self.cleanup()
+        return False
+
+
 def _strip_outer_fence(text: str) -> str:
     """If `text` is fully wrapped in a markdown code fence, remove it."""
     stripped = text.strip()
@@ -321,7 +448,9 @@ def phase1_claim_and_plan(repo: str, issue: dict) -> tuple[str, dict] | None:
         pass
     git("checkout", "-b", branch, cwd=root)
     git("commit", "--allow-empty", "-m", f"plan: {title} (#{num})", cwd=root)
-    git("push", "-u", "origin", branch, cwd=root)
+    # Explicit refspec, no -u: upstream tracking writes shared .git/config,
+    # which contends across concurrent worktree workers (spike 0.1).
+    git_retry("push", "origin", f"HEAD:{branch}", cwd=root)
 
     prompt = load_prompt(
         "phase1_claim_and_plan",
@@ -443,11 +572,10 @@ def phase4_implement(repo: str, pr: dict) -> tuple[str, dict] | None:
     plan = gh("pr", "view", str(num), "--repo", repo, "--json", "body", "-q", ".body")
     branch = get_pr_branch(repo, num)
 
+    # The main clone is never checked out, cleaned, or pulled here — all
+    # work happens in an isolated worktree on the PR branch.
     root = _repo_root()
     git("fetch", "origin", branch, cwd=root)
-    git("clean", "-fd", cwd=root)
-    git("checkout", branch, cwd=root)
-    git("pull", "--ff-only", "origin", branch, cwd=root)
 
     prompt = load_prompt(
         "phase4_implement",
@@ -456,8 +584,10 @@ def phase4_implement(repo: str, pr: dict) -> tuple[str, dict] | None:
         repo=repo,
         branch=branch,
     )
-    workdir = git("rev-parse", "--show-toplevel", cwd=root)
-    llm_interactive(prompt, workdir)
+    with Worktree(root, branch) as wt:
+        # A pre-existing local branch may lag the remote; catch up ff-only.
+        git("merge", "--ff-only", f"origin/{branch}", cwd=wt.path)
+        llm_interactive(prompt, wt.path)
 
     log(f"Phase 4 complete: implementation done for PR #{num}")
     return ("phase5_post_implementation", {"repo": repo, "pr": pr})
@@ -515,10 +645,9 @@ def phase6_process_review(repo: str, pr: dict) -> tuple[str, dict] | None:
 
     if action == "changes_requested":
         branch = get_pr_branch(repo, num)
+        # Never touch the main clone's checkout — fixes happen in a worktree.
         root = _repo_root()
         git("fetch", "origin", branch, cwd=root)
-        git("checkout", branch, cwd=root)
-        git("pull", "--ff-only", "origin", branch, cwd=root)
 
         fix_prompt = load_prompt(
             "phase6_apply_fixes",
@@ -527,8 +656,9 @@ def phase6_process_review(repo: str, pr: dict) -> tuple[str, dict] | None:
             reviews=reviews,
             branch=branch,
         )
-        workdir = git("rev-parse", "--show-toplevel", cwd=root)
-        llm_interactive(fix_prompt, workdir)
+        with Worktree(root, branch) as wt:
+            git("merge", "--ff-only", f"origin/{branch}", cwd=wt.path)
+            llm_interactive(fix_prompt, wt.path)
 
         review_data = json.loads(reviews)
         review_nodes = review_data.get("reviews", {}).get("nodes", []) if isinstance(review_data.get("reviews"), dict) else review_data.get("reviews", [])

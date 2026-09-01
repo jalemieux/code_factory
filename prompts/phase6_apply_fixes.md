@@ -22,10 +22,11 @@ After applying all fixes:
 2. Commit with a clear message referencing the review (e.g., "fix: address review feedback on PR #{pr_number}")
 3. Push to the branch:
    ```
-   git push origin {branch}
+   git push origin HEAD:{branch}
    ```
 
 Important:
 - Do not force-push — it destroys review context
+- Push exactly as shown above (explicit refspec); never use `-u`/`--set-upstream` — upstream tracking writes shared git config that contends across concurrent worktrees
 - Keep changes focused on what was requested — do not refactor or "improve" unrelated code
 - Every commit should leave the repo in a working state
