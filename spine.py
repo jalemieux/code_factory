@@ -158,17 +158,14 @@ def _issue_num_from_branch(branch: str) -> int | None:
 
 
 def ensure_labels(repo: str) -> None:
-    for label in (
-        "bot:plan-proposed",
-        "bot:plan-accepted",
-        "bot:in-progress",
-        "bot:review-requested",
-    ):
+    """Create every label in SCHEMA (idempotent via --force)."""
+    for label in SCHEMA["labels"].values():
+        color = "B60205" if label == SCHEMA["labels"]["failed"] else "0E8A16"
         gh(
             "label", "create", label,
             "--repo", repo,
             "--description", "Managed by git-contribute",
-            "--color", "0E8A16",
+            "--color", color,
             "--force",
         )
 
@@ -222,6 +219,16 @@ def get_in_progress_prs(repo: str) -> set[int]:
         "--json", "number,labels",
     )
     return {pr["number"] for pr in prs if _has_label(pr, "bot:in-progress")}
+
+
+def get_failed_prs(repo: str) -> set[int]:
+    """PRs parked as bot:failed — routing must skip them until a human unlabels."""
+    prs = gh_json(
+        "pr", "list", "--repo", repo,
+        "--label", "bot:failed",
+        "--json", "number,labels",
+    )
+    return {pr["number"] for pr in prs if _has_label(pr, "bot:failed")}
 
 
 def open_plan_count(repo: str) -> int:

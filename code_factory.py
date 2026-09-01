@@ -10,13 +10,16 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 # GitHub state-machine primitives live in spine (see agentic-stack-v2.md);
 # this file keeps the phase logic and drives them.
 from spine import (
     PHASE2_MARKER,
+    WIP_LIMIT,
     _fmt_argv,
     _issue_num_from_branch,
     add_in_progress,
@@ -27,11 +30,13 @@ from spine import (
     check_review_requested,
     check_unclaimed_issues,
     ensure_labels,
+    get_failed_prs,
     get_in_progress_prs,
     get_repo,
     gh,
     gh_json,
     log,
+    open_plan_count,
     remove_in_progress,
     slugify,
     swap_label,
@@ -39,7 +44,18 @@ from spine import (
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 ENV_FILE = Path(__file__).parent / ".env"
+LOGS_DIR = Path(__file__).parent / "logs"  # gitignored; streamed agent output + failure state
 AGENT_CLI = "claude"
+
+# Wall-clock limit for a single agent invocation (task 2.4). Overridable
+# with --timeout-minutes; a timeout is treated as a phase failure.
+PHASE_TIMEOUT_SECONDS: float = 30 * 60
+
+# Consecutive failures on the same PR before it's parked as bot:failed.
+FAILURE_THRESHOLD = 2
+
+# Claims (bot:in-progress) older than this are cleared by the janitor.
+IN_PROGRESS_MAX_AGE_HOURS = 2.0
 
 # Absolute path of the main clone, set by bootstrap_repo(). Phase code asks
 # for it via _repo_root() and passes it (or a worktree path) explicitly to
@@ -312,22 +328,107 @@ def load_prompt(phase: str, **kwargs: str) -> str:
     return template.format(**kwargs)
 
 
-def _run_agent_command(command: list[str], *, cwd: str | None = None) -> str:
-    result = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        cwd=cwd,
-    )
-    if result.returncode != 0:
-        stderr = result.stderr.strip()
-        stdout = result.stdout.strip()
-        detail = stderr or stdout or "(no output)"
-        raise RuntimeError(f"{command[0]} failed (exit {result.returncode}): {detail}")
-    return result.stdout.strip()
+def _log_path(log_name: str | None) -> str | None:
+    """logs/<unit>-<phase>.log for a unit like 'pr-42' + phase name."""
+    if not log_name:
+        return None
+    return str(LOGS_DIR / f"{log_name}.log")
 
 
-def _codex(prompt: str, *, workdir: str | None = None, interactive: bool = False) -> str:
+def _run_agent_command(
+    command: list[str],
+    *,
+    cwd: str | None = None,
+    timeout: float | None = None,
+    log_path: str | None = None,
+) -> str:
+    """Run an agent CLI: stream stdout/stderr to `log_path` live (tail -f
+    friendly), enforce a wall-clock timeout, and return captured stdout.
+
+    A timeout kills the process and raises — callers treat it as a phase
+    failure like any other.
+    """
+    if timeout is None:
+        timeout = PHASE_TIMEOUT_SECONDS
+    log_fh = None
+    if log_path:
+        Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+        log_fh = open(log_path, "a", encoding="utf-8", errors="replace")
+        log_fh.write(f"\n=== {datetime.now():%Y-%m-%d %H:%M:%S} {_fmt_argv(command[0], tuple(command[1:]))}\n")
+        log_fh.flush()
+    lock = threading.Lock()
+
+    def _pump(stream, sink: list[str]) -> None:
+        for line in stream:
+            sink.append(line)
+            if log_fh:
+                with lock:
+                    log_fh.write(line)
+                    log_fh.flush()
+        stream.close()
+
+    out: list[str] = []
+    err: list[str] = []
+    try:
+        proc = subprocess.Popen(
+            command, cwd=cwd, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        pumps = [
+            threading.Thread(target=_pump, args=(proc.stdout, out), daemon=True),
+            threading.Thread(target=_pump, args=(proc.stderr, err), daemon=True),
+        ]
+        for t in pumps:
+            t.start()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            raise RuntimeError(
+                f"{command[0]} timed out after {timeout:.0f}s (wall clock) — phase failed"
+            )
+        for t in pumps:
+            t.join(timeout=10)
+    finally:
+        if log_fh:
+            log_fh.close()
+    if proc.returncode != 0:
+        detail = "".join(err).strip() or "".join(out).strip() or "(no output)"
+        raise RuntimeError(f"{command[0]} failed (exit {proc.returncode}): {detail}")
+    return "".join(out).strip()
+
+
+def _claude_result_from_stream(raw: str) -> str:
+    """Extract the final result from `--output-format stream-json` output.
+
+    The stream is one JSON event per line; the terminal event has
+    type "result". Falls back to the raw text if no result event is found
+    (e.g. an older CLI without stream-json).
+    """
+    for line in reversed(raw.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(event, dict) and event.get("type") == "result":
+            if event.get("is_error"):
+                detail = event.get("result") or event.get("error") or line[:400]
+                raise RuntimeError(f"claude reported an error result: {detail}")
+            return (event.get("result") or "").strip()
+    return raw.strip()
+
+
+def _codex(
+    prompt: str,
+    *,
+    workdir: str | None = None,
+    interactive: bool = False,
+    log_name: str | None = None,
+) -> str:
     with tempfile.NamedTemporaryFile(mode="r+", encoding="utf-8") as tmp:
         command = ["codex", "exec", "-o", tmp.name]
         if interactive:
@@ -337,46 +438,165 @@ def _codex(prompt: str, *, workdir: str | None = None, interactive: bool = False
         if workdir:
             command.extend(["-C", workdir])
         command.append(prompt)
-        _run_agent_command(command, cwd=workdir)
+        # Result comes from the -o tmpfile; stdout is still teed to the log.
+        _run_agent_command(command, cwd=workdir, log_path=_log_path(log_name))
         tmp.seek(0)
         return tmp.read().strip()
 
 
-def llm_reason(prompt: str) -> str:
+def llm_reason(prompt: str, log_name: str | None = None) -> str:
     """Run the configured agent CLI for reasoning tasks."""
     if AGENT_CLI == "codex":
-        return _codex(prompt)
-    return _run_agent_command(["claude", "-p", prompt, "--print"])
+        return _codex(prompt, log_name=log_name)
+    raw = _run_agent_command(
+        ["claude", "-p", prompt, "--print", "--output-format", "stream-json", "--verbose"],
+        log_path=_log_path(log_name),
+    )
+    return _claude_result_from_stream(raw)
 
 
-def llm_interactive(prompt: str, workdir: str) -> str:
+def llm_interactive(prompt: str, workdir: str, log_name: str | None = None) -> str:
     """Run the configured agent CLI with tool access for implementation work."""
     if AGENT_CLI == "codex":
-        return _codex(prompt, workdir=workdir, interactive=True)
-    return _run_agent_command(
-        ["claude", "--dangerously-skip-permissions", "-p", prompt, "--print"],
+        return _codex(prompt, workdir=workdir, interactive=True, log_name=log_name)
+    raw = _run_agent_command(
+        [
+            "claude", "--dangerously-skip-permissions", "-p", prompt, "--print",
+            "--output-format", "stream-json", "--verbose",
+        ],
         cwd=workdir,
+        log_path=_log_path(log_name),
     )
+    return _claude_result_from_stream(raw)
+
+
+# --- Failure protection (task 2.4) ---
+# Consecutive-failure counts live in logs/failure_counts.json so they
+# survive across `run` invocations (each unit is its own process). Keyed
+# "repo#pr"; a successful chain clears the entry.
+
+FAILURE_STATE_PATH = LOGS_DIR / "failure_counts.json"
+
+
+def _load_failure_counts() -> dict[str, int]:
+    try:
+        return json.loads(FAILURE_STATE_PATH.read_text())
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+
+
+def _save_failure_counts(counts: dict[str, int]) -> None:
+    FAILURE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    FAILURE_STATE_PATH.write_text(json.dumps(counts, indent=2))
+
+
+def record_failure(repo: str, num: int) -> int:
+    """Increment and return the consecutive-failure count for a PR."""
+    counts = _load_failure_counts()
+    key = f"{repo}#{num}"
+    counts[key] = counts.get(key, 0) + 1
+    _save_failure_counts(counts)
+    return counts[key]
+
+
+def clear_failures(repo: str, num: int) -> None:
+    counts = _load_failure_counts()
+    if counts.pop(f"{repo}#{num}", None) is not None:
+        _save_failure_counts(counts)
+
+
+def _log_tail(log_path: str | None, lines: int = 30) -> str:
+    if not log_path or not os.path.exists(log_path):
+        return "(no log captured)"
+    try:
+        content = Path(log_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "(log unreadable)"
+    return "\n".join(content.splitlines()[-lines:]) or "(log empty)"
+
+
+def mark_failed(repo: str, num: int, reason: str, log_path: str | None = None) -> None:
+    """Park a PR as bot:failed with an explanatory comment + log tail.
+
+    Routing skips bot:failed PRs; a human removes the label to retry.
+    """
+    add_label(repo, num, "bot:failed")
+    body = (
+        f"**Code Factory marked this PR `bot:failed`**\n\n{reason}\n\n"
+        f"Log tail:\n```\n{_log_tail(log_path)}\n```\n"
+        "Remove the `bot:failed` label to let the bot retry."
+    )
+    gh("pr", "comment", str(num), "--repo", repo, "--body", body)
+    log(f"PR #{num} marked bot:failed: {reason}")
+
+
+# --- Janitor ---
+
+def _in_progress_labeled_at(repo: str, num: int) -> datetime | None:
+    """When `bot:in-progress` was last applied to this PR.
+
+    Mechanism (documented choice): the GitHub issue-events API's `labeled`
+    event `created_at` — one cheap extra call per in-progress PR (there are
+    at most a handful at a time), and it's authoritative, unlike scanning
+    for a claim comment.
+    """
+    try:
+        raw = gh(
+            "api", f"repos/{repo}/issues/{num}/events", "--paginate",
+            "--jq",
+            '.[] | select(.event == "labeled" and .label.name == "bot:in-progress") | .created_at',
+        )
+    except RuntimeError:
+        return None
+    stamps = [line for line in raw.splitlines() if line.strip()]
+    if not stamps:
+        return None
+    try:
+        return datetime.strptime(stamps[-1].strip(), "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        return None
+
+
+def janitor_clear_stale_claims(repo: str, max_age_hours: float = IN_PROGRESS_MAX_AGE_HOURS) -> None:
+    """Clear bot:in-progress claims older than max_age_hours (dead workers)."""
+    now = datetime.now(timezone.utc)
+    for num in sorted(get_in_progress_prs(repo)):
+        labeled_at = _in_progress_labeled_at(repo, num)
+        if labeled_at is None:
+            continue  # can't date the claim — leave it for a human
+        age_hours = (now - labeled_at).total_seconds() / 3600
+        if age_hours > max_age_hours:
+            log(f"Janitor: clearing stale bot:in-progress on #{num} (claimed {age_hours:.1f}h ago)")
+            remove_in_progress(repo, num)
 
 
 def route(repo: str) -> tuple[str, dict] | None:
     """Find highest-priority actionable work. Returns (phase_name, context) or None."""
-    in_progress = get_in_progress_prs(repo)
+    janitor_clear_stale_claims(repo)
+    # Skip active claims and PRs parked as bot:failed (human unlabels to retry).
+    skip = get_in_progress_prs(repo) | get_failed_prs(repo)
 
     for pr in check_review_requested(repo):
-        if pr["number"] not in in_progress:
+        if pr["number"] not in skip:
             return ("phase6_process_review", {"repo": repo, "pr": pr})
 
     for pr in check_plan_feedback(repo):
-        if pr["number"] not in in_progress:
+        if pr["number"] not in skip:
             return ("phase2_process_feedback", {"repo": repo, "pr": pr})
 
     for pr in check_accepted_plans(repo):
-        if pr["number"] not in in_progress:
+        if pr["number"] not in skip:
             return ("phase4_implement", {"repo": repo, "pr": pr})
 
-    for issue in check_unclaimed_issues(repo):
-        return ("phase1_claim_and_plan", {"repo": repo, "issue": issue})
+    issues = check_unclaimed_issues(repo)
+    if issues:
+        # WIP limit: don't open new plans while too many await a human.
+        if open_plan_count(repo) >= WIP_LIMIT:
+            log(f"WIP limit reached ({WIP_LIMIT} open plans) — not claiming new issues")
+        else:
+            return ("phase1_claim_and_plan", {"repo": repo, "issue": issues[0]})
 
     return None
 
@@ -462,7 +682,7 @@ def phase1_claim_and_plan(repo: str, issue: dict) -> tuple[str, dict] | None:
         conventions=conventions,
         recent_prs=recent_prs,
     )
-    plan = llm_reason(prompt)
+    plan = llm_reason(prompt, log_name=f"issue-{num}-phase1_claim_and_plan")
     plan_body = _strip_outer_fence(plan)
     # Always append `Closes #N` on its own line, outside any fence, so GitHub
     # links the PR to the issue (the LLM often buries it inside a code block).
@@ -519,7 +739,7 @@ def phase2_process_feedback(repo: str, pr: dict) -> tuple[str, dict] | None:
         plan_body=plan_body,
         comments=comments,
     )
-    result = llm_reason(prompt)
+    result = llm_reason(prompt, log_name=f"pr-{num}-phase2_process_feedback")
     parsed = parse_claude_json(result)
 
     if not parsed or "action" not in parsed:
@@ -588,7 +808,7 @@ def phase4_implement(repo: str, pr: dict) -> tuple[str, dict] | None:
     with Worktree(root, branch) as wt:
         # A pre-existing local branch may lag the remote; catch up ff-only.
         git("merge", "--ff-only", f"origin/{branch}", cwd=wt.path)
-        llm_interactive(prompt, wt.path)
+        llm_interactive(prompt, wt.path, log_name=f"pr-{num}-phase4_implement")
 
     log(f"Phase 4 complete: implementation done for PR #{num}")
     return ("phase5_post_implementation", {"repo": repo, "pr": pr})
@@ -628,7 +848,7 @@ def phase6_process_review(repo: str, pr: dict) -> tuple[str, dict] | None:
         pr_title=pr["title"],
         reviews=reviews,
     )
-    result = llm_reason(prompt)
+    result = llm_reason(prompt, log_name=f"pr-{num}-phase6_process_review")
     parsed = parse_claude_json(result)
 
     if not parsed or "action" not in parsed:
@@ -659,7 +879,7 @@ def phase6_process_review(repo: str, pr: dict) -> tuple[str, dict] | None:
         )
         with Worktree(root, branch) as wt:
             git("merge", "--ff-only", f"origin/{branch}", cwd=wt.path)
-            llm_interactive(fix_prompt, wt.path)
+            llm_interactive(fix_prompt, wt.path, log_name=f"pr-{num}-phase6_apply_fixes")
 
         review_data = json.loads(reviews)
         review_nodes = review_data.get("reviews", {}).get("nodes", []) if isinstance(review_data.get("reviews"), dict) else review_data.get("reviews", [])
@@ -744,7 +964,13 @@ for _name in PHASES:
 
 
 def run_chain(start: tuple[str, dict]) -> bool:
-    """Execute one phase chain to completion. Returns True on success."""
+    """Execute one phase chain to completion. Returns True on success.
+
+    Failure protection (task 2.4): a WorktreeCleanupRefused parks the PR as
+    bot:failed immediately (unpushed/dirty state needs a human); any other
+    failure increments the consecutive-failure counter, and the second in a
+    row parks the PR with the log tail. Success clears the counter.
+    """
     phase_name, ctx = start
     try:
         next_result = start
@@ -752,15 +978,36 @@ def run_chain(start: tuple[str, dict]) -> bool:
             phase_name, ctx = next_result
             phase_fn = PHASES[phase_name]
             next_result = phase_fn(**ctx)
+        pr = ctx.get("pr")
+        if pr:
+            clear_failures(ctx["repo"], pr["number"])
         return True
     except Exception as e:
         log(f"Error in {phase_name}: {e}")
         pr = ctx.get("pr")
         if pr:
+            repo, num = ctx["repo"], pr["number"]
             try:
-                remove_in_progress(ctx["repo"], pr["number"])
+                remove_in_progress(repo, num)
             except Exception:
                 pass
+            unit = f"pr-{num}" if "pr" in ctx else f"issue-{num}"
+            log_path = _log_path(f"{unit}-{phase_name}")
+            try:
+                if isinstance(e, WorktreeCleanupRefused):
+                    mark_failed(repo, num, f"{phase_name}: {e}", log_path)
+                    clear_failures(repo, num)
+                else:
+                    count = record_failure(repo, num)
+                    if count >= FAILURE_THRESHOLD:
+                        mark_failed(
+                            repo, num,
+                            f"{phase_name} failed {count} consecutive times; last error: {e}",
+                            log_path,
+                        )
+                        clear_failures(repo, num)
+            except Exception as protect_err:
+                log(f"Failure-protection error on #{num}: {protect_err}")
         return False
 
 
@@ -768,6 +1015,10 @@ def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--repo", help="owner/repo (default: current repo)")
     common.add_argument("--agent", choices=("claude", "codex"), help="agent CLI to use (default: claude)")
+    common.add_argument(
+        "--timeout-minutes", type=float, default=None, metavar="M",
+        help="wall-clock limit per agent invocation (default: 30); a timeout fails the phase",
+    )
 
     parser = argparse.ArgumentParser(
         description="Code Factory — autonomous GitHub contributions",
@@ -863,8 +1114,10 @@ def cmd_loop(args: argparse.Namespace) -> int:
 def main() -> None:
     args = build_parser().parse_args()
 
-    global AGENT_CLI
+    global AGENT_CLI, PHASE_TIMEOUT_SECONDS
     AGENT_CLI = args.agent or "claude"
+    if args.timeout_minutes:
+        PHASE_TIMEOUT_SECONDS = args.timeout_minutes * 60
 
     load_env()
     if "GH_TOKEN" in os.environ:

@@ -302,6 +302,9 @@ class TestCheckUnclaimed(unittest.TestCase):
         self.assertEqual(result, [{"number": 1, "title": "Bug", "labels": [], "assignees": []}])
 
 
+@patch("code_factory.janitor_clear_stale_claims")
+@patch("code_factory.open_plan_count", return_value=0)
+@patch("code_factory.get_failed_prs", return_value=set())
 class TestRoute(unittest.TestCase):
     @patch("code_factory.check_unclaimed_issues", return_value=[])
     @patch("code_factory.check_accepted_plans", return_value=[])
@@ -311,12 +314,12 @@ class TestRoute(unittest.TestCase):
     def test_returns_none_when_no_work(self, *_):
         self.assertIsNone(code_factory.route("owner/repo"))
 
-    @patch("code_factory.check_unclaimed_issues")
+    @patch("code_factory.check_unclaimed_issues", return_value=[])
     @patch("code_factory.check_accepted_plans", return_value=[])
     @patch("code_factory.check_plan_feedback", return_value=[])
     @patch("code_factory.check_review_requested", return_value=[{"number": 5, "title": "Fix"}])
     @patch("code_factory.get_in_progress_prs", return_value=set())
-    def test_priority1_takes_precedence(self, _, mock_review, *__):
+    def test_priority1_takes_precedence(self, *_):
         result = code_factory.route("owner/repo")
         self.assertEqual(result[0], "phase6_process_review")
         self.assertEqual(result[1]["pr"]["number"], 5)
@@ -331,7 +334,7 @@ class TestRoute(unittest.TestCase):
         self.assertEqual(result[0], "phase1_claim_and_plan")
         self.assertEqual(result[1]["issue"]["number"], 10)
 
-    @patch("code_factory.check_unclaimed_issues")
+    @patch("code_factory.check_unclaimed_issues", return_value=[])
     @patch("code_factory.check_accepted_plans", return_value=[])
     @patch("code_factory.check_plan_feedback", return_value=[])
     @patch("code_factory.check_review_requested", return_value=[{"number": 5, "title": "Fix"}])
@@ -339,6 +342,48 @@ class TestRoute(unittest.TestCase):
     def test_in_progress_pr_excluded(self, *_):
         result = code_factory.route("owner/repo")
         self.assertIsNone(result)
+
+    def test_janitor_runs_on_every_route(self, mock_failed, mock_count, mock_janitor):
+        with patch("code_factory.get_in_progress_prs", return_value=set()), \
+             patch("code_factory.check_review_requested", return_value=[]), \
+             patch("code_factory.check_plan_feedback", return_value=[]), \
+             patch("code_factory.check_accepted_plans", return_value=[]), \
+             patch("code_factory.check_unclaimed_issues", return_value=[]):
+            code_factory.route("owner/repo")
+        mock_janitor.assert_called_once_with("owner/repo")
+
+
+@patch("code_factory.janitor_clear_stale_claims")
+class TestRouteProtection(unittest.TestCase):
+    @patch("code_factory.check_unclaimed_issues", return_value=[])
+    @patch("code_factory.check_accepted_plans", return_value=[])
+    @patch("code_factory.check_plan_feedback", return_value=[])
+    @patch("code_factory.check_review_requested", return_value=[{"number": 5, "title": "Fix"}])
+    @patch("code_factory.get_failed_prs", return_value={5})
+    @patch("code_factory.get_in_progress_prs", return_value=set())
+    def test_bot_failed_pr_is_skipped(self, *_):
+        self.assertIsNone(code_factory.route("owner/repo"))
+
+    @patch("code_factory.open_plan_count", return_value=code_factory.WIP_LIMIT)
+    @patch("code_factory.check_unclaimed_issues", return_value=[{"number": 10, "title": "New"}])
+    @patch("code_factory.check_accepted_plans", return_value=[])
+    @patch("code_factory.check_plan_feedback", return_value=[])
+    @patch("code_factory.check_review_requested", return_value=[])
+    @patch("code_factory.get_failed_prs", return_value=set())
+    @patch("code_factory.get_in_progress_prs", return_value=set())
+    def test_wip_limit_refuses_new_plans(self, *_):
+        self.assertIsNone(code_factory.route("owner/repo"))
+
+    @patch("code_factory.open_plan_count", return_value=code_factory.WIP_LIMIT - 1)
+    @patch("code_factory.check_unclaimed_issues", return_value=[{"number": 10, "title": "New"}])
+    @patch("code_factory.check_accepted_plans", return_value=[])
+    @patch("code_factory.check_plan_feedback", return_value=[])
+    @patch("code_factory.check_review_requested", return_value=[])
+    @patch("code_factory.get_failed_prs", return_value=set())
+    @patch("code_factory.get_in_progress_prs", return_value=set())
+    def test_under_wip_limit_still_plans(self, *_):
+        result = code_factory.route("owner/repo")
+        self.assertEqual(result[0], "phase1_claim_and_plan")
 
 
 class TestParseClaudeJson(unittest.TestCase):
@@ -464,7 +509,10 @@ class TestAgentSelection(unittest.TestCase):
         finally:
             code_factory.AGENT_CLI = original
         self.assertEqual(result, "ok")
-        mock_run.assert_called_once_with(["claude", "-p", "prompt", "--print"])
+        mock_run.assert_called_once_with(
+            ["claude", "-p", "prompt", "--print", "--output-format", "stream-json", "--verbose"],
+            log_path=None,
+        )
 
     @patch("code_factory._codex")
     def test_llm_reason_uses_codex_when_selected(self, mock_codex):
@@ -476,7 +524,7 @@ class TestAgentSelection(unittest.TestCase):
         finally:
             code_factory.AGENT_CLI = original
         self.assertEqual(result, "ok")
-        mock_codex.assert_called_once_with("prompt")
+        mock_codex.assert_called_once_with("prompt", log_name=None)
 
     @patch("code_factory._run_agent_command")
     def test_llm_interactive_uses_claude(self, mock_run):
@@ -489,8 +537,12 @@ class TestAgentSelection(unittest.TestCase):
             code_factory.AGENT_CLI = original
         self.assertEqual(result, "ok")
         mock_run.assert_called_once_with(
-            ["claude", "--dangerously-skip-permissions", "-p", "prompt", "--print"],
+            [
+                "claude", "--dangerously-skip-permissions", "-p", "prompt", "--print",
+                "--output-format", "stream-json", "--verbose",
+            ],
             cwd="/tmp/repo",
+            log_path=None,
         )
 
     @patch("code_factory._codex")
@@ -503,7 +555,9 @@ class TestAgentSelection(unittest.TestCase):
         finally:
             code_factory.AGENT_CLI = original
         self.assertEqual(result, "ok")
-        mock_codex.assert_called_once_with("prompt", workdir="/tmp/repo", interactive=True)
+        mock_codex.assert_called_once_with(
+            "prompt", workdir="/tmp/repo", interactive=True, log_name=None
+        )
 
 
 class TestMain(unittest.TestCase):
