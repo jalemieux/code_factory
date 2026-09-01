@@ -40,6 +40,15 @@ PROMPTS_DIR = Path(__file__).parent / "prompts"
 ENV_FILE = Path(__file__).parent / ".env"
 AGENT_CLI = "claude"
 
+# Absolute path of the main clone, set by bootstrap_repo(). Phase code asks
+# for it via _repo_root() and passes it (or a worktree path) explicitly to
+# every git() call — nothing below bootstrap relies on the process cwd.
+REPO_ROOT: str | None = None
+
+
+def _repo_root() -> str:
+    return REPO_ROOT or os.getcwd()
+
 
 def load_env(path: Path = ENV_FILE) -> None:
     """Load KEY=VALUE pairs from a .env next to the script into os.environ.
@@ -117,8 +126,13 @@ def fetch_review_payload(repo: str, num: int) -> str:
     return json.dumps(pr_data, indent=2)
 
 
-def git(*args: str) -> str:
-    """Run a git command, raise on failure."""
+def git(*args: str, cwd: str | None = None) -> str:
+    """Run a git command, raise on failure.
+
+    `cwd=None` keeps legacy behavior (the process working directory); phase
+    code always passes an explicit cwd so work can happen in worktrees
+    without `os.chdir` games.
+    """
     cmd = ["git"]
     if os.environ.get("GH_TOKEN"):
         # Force github.com pushes/fetches to authenticate with the token from
@@ -129,7 +143,7 @@ def git(*args: str) -> str:
             "-c", "credential.https://github.com.helper=!gh auth git-credential",
         ])
     cmd.extend(args)
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or "<no output>"
         raise RuntimeError(
@@ -153,11 +167,11 @@ def _strip_outer_fence(text: str) -> str:
     return inner
 
 
-def read_repo_conventions(repo: str) -> str:
+def read_repo_conventions(repo: str, cwd: str | None = None) -> str:
     conventions = []
     for fname in ("CONTRIBUTING.md", "CLAUDE.md", "AGENTS.md", "CODING_GUIDELINES.md"):
         try:
-            content = git("show", f"HEAD:{fname}")
+            content = git("show", f"HEAD:{fname}", cwd=cwd or _repo_root())
             conventions.append(f"## {fname}\n{content}")
         except RuntimeError:
             pass
@@ -281,7 +295,8 @@ def phase1_claim_and_plan(repo: str, issue: dict) -> tuple[str, dict] | None:
         "--json", "comments",
         "--jq", r'.comments[] | "\(.author.login) (\(.createdAt)): \(.body)"',
     ) or "(none)"
-    conventions = read_repo_conventions(repo)
+    root = _repo_root()
+    conventions = read_repo_conventions(repo, cwd=root)
     recent_prs = gh(
         "pr", "list", "--repo", repo, "--state", "merged",
         "--limit", "5", "--json", "title,body",
@@ -290,23 +305,23 @@ def phase1_claim_and_plan(repo: str, issue: dict) -> tuple[str, dict] | None:
     slug = slugify(title)
     branch = f"bot/{num}-{slug}"
     default_branch = gh("repo", "view", repo, "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name")
-    git("checkout", default_branch)
-    git("pull", "--ff-only")
+    git("checkout", default_branch, cwd=root)
+    git("pull", "--ff-only", cwd=root)
     # Clean up stale local branch from a previous failed run
     try:
-        git("branch", "-D", branch)
+        git("branch", "-D", branch, cwd=root)
     except RuntimeError:
         pass
     # Also delete any stale remote branch — a prior phase1 may have pushed
     # before failing, leaving a remote ref that would cause non-fast-forward
     # rejection when we push the fresh branch built from the default branch.
     try:
-        git("push", "origin", "--delete", branch)
+        git("push", "origin", "--delete", branch, cwd=root)
     except RuntimeError:
         pass
-    git("checkout", "-b", branch)
-    git("commit", "--allow-empty", "-m", f"plan: {title} (#{num})")
-    git("push", "-u", "origin", branch)
+    git("checkout", "-b", branch, cwd=root)
+    git("commit", "--allow-empty", "-m", f"plan: {title} (#{num})", cwd=root)
+    git("push", "-u", "origin", branch, cwd=root)
 
     prompt = load_prompt(
         "phase1_claim_and_plan",
@@ -428,10 +443,11 @@ def phase4_implement(repo: str, pr: dict) -> tuple[str, dict] | None:
     plan = gh("pr", "view", str(num), "--repo", repo, "--json", "body", "-q", ".body")
     branch = get_pr_branch(repo, num)
 
-    git("fetch", "origin", branch)
-    git("clean", "-fd")
-    git("checkout", branch)
-    git("pull", "--ff-only", "origin", branch)
+    root = _repo_root()
+    git("fetch", "origin", branch, cwd=root)
+    git("clean", "-fd", cwd=root)
+    git("checkout", branch, cwd=root)
+    git("pull", "--ff-only", "origin", branch, cwd=root)
 
     prompt = load_prompt(
         "phase4_implement",
@@ -440,7 +456,7 @@ def phase4_implement(repo: str, pr: dict) -> tuple[str, dict] | None:
         repo=repo,
         branch=branch,
     )
-    workdir = git("rev-parse", "--show-toplevel")
+    workdir = git("rev-parse", "--show-toplevel", cwd=root)
     llm_interactive(prompt, workdir)
 
     log(f"Phase 4 complete: implementation done for PR #{num}")
@@ -499,9 +515,10 @@ def phase6_process_review(repo: str, pr: dict) -> tuple[str, dict] | None:
 
     if action == "changes_requested":
         branch = get_pr_branch(repo, num)
-        git("fetch", "origin", branch)
-        git("checkout", branch)
-        git("pull", "--ff-only", "origin", branch)
+        root = _repo_root()
+        git("fetch", "origin", branch, cwd=root)
+        git("checkout", branch, cwd=root)
+        git("pull", "--ff-only", "origin", branch, cwd=root)
 
         fix_prompt = load_prompt(
             "phase6_apply_fixes",
@@ -510,7 +527,7 @@ def phase6_process_review(repo: str, pr: dict) -> tuple[str, dict] | None:
             reviews=reviews,
             branch=branch,
         )
-        workdir = git("rev-parse", "--show-toplevel")
+        workdir = git("rev-parse", "--show-toplevel", cwd=root)
         llm_interactive(fix_prompt, workdir)
 
         review_data = json.loads(reviews)
@@ -542,18 +559,27 @@ PHASES: dict[str, callable] = {
 }
 
 
-def bootstrap_repo(repo: str) -> None:
-    """Ensure the repo is cloned and default branch is synced."""
+def bootstrap_repo(repo: str, sync: bool = True) -> None:
+    """Ensure the repo is cloned, record REPO_ROOT, and optionally sync.
+
+    `sync=True` (legacy loop behavior) checks out and ff-pulls the default
+    branch. `run` mode passes `sync=False`: each phase fetches exactly what
+    it needs, and worktree-based phases must never have the main clone's
+    checkout moved underneath them.
+    """
+    global REPO_ROOT
     # Check if we're already inside the target repo
     try:
         current_repo = gh("repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner")
         if current_repo == repo:
-            default_branch = gh(
-                "repo", "view", repo,
-                "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name",
-            )
-            git("checkout", default_branch)
-            git("pull", "--ff-only")
+            REPO_ROOT = git("rev-parse", "--show-toplevel", cwd=os.getcwd())
+            if sync:
+                default_branch = gh(
+                    "repo", "view", repo,
+                    "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name",
+                )
+                git("checkout", default_branch, cwd=REPO_ROOT)
+                git("pull", "--ff-only", cwd=REPO_ROOT)
             return
     except RuntimeError:
         pass
@@ -561,16 +587,19 @@ def bootstrap_repo(repo: str) -> None:
     repo_name = repo.split("/")[-1]
     if os.path.isdir(repo_name):
         os.chdir(repo_name)
-        default_branch = gh(
-            "repo", "view", repo,
-            "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name",
-        )
-        git("checkout", default_branch)
-        git("pull", "--ff-only")
+        REPO_ROOT = os.getcwd()
+        if sync:
+            default_branch = gh(
+                "repo", "view", repo,
+                "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name",
+            )
+            git("checkout", default_branch, cwd=REPO_ROOT)
+            git("pull", "--ff-only", cwd=REPO_ROOT)
         log(f"Entered existing clone: {repo}")
     else:
         gh("repo", "clone", repo)
         os.chdir(repo_name)
+        REPO_ROOT = os.getcwd()
         log(f"Cloned and entered {repo}")
 
 
