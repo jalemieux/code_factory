@@ -103,6 +103,10 @@ SCHEMA = {
     },
     "wip_limit": 10,
     "branch_pattern": "bot/<issue>-<slug>",
+    # Whose reviews count. On a public repo anyone can submit an APPROVED
+    # review; only accounts with a standing relationship to the repo may
+    # move a PR (GitHub's authorAssociation values).
+    "trusted_review_associations": ("OWNER", "MEMBER", "COLLABORATOR"),
     # Tier path-globs, per repo (fnmatch syntax; `*` crosses slashes, so
     # `dir/**` and `dir/*` both match nested paths — when in doubt, tier A).
     # Anything not matching A or B is tier C. Curunir's A set was widened
@@ -130,6 +134,12 @@ SCHEMA = {
 }
 
 WIP_LIMIT = SCHEMA["wip_limit"]
+TRUSTED_REVIEW_ASSOCIATIONS = SCHEMA["trusted_review_associations"]
+
+
+def is_trusted_reviewer(author_association: str | None) -> bool:
+    """True when a review/comment author may influence a PR's state."""
+    return author_association in TRUSTED_REVIEW_ASSOCIATIONS
 
 # Strictest first — used to resolve mixed-tier diffs.
 TIERS = ("A", "B", "C")
@@ -296,11 +306,16 @@ def check_review_requested(repo: str) -> list[dict]:
     Authorship is intentionally not filtered — a `bot:*` label is the opt-in
     signal that the bot should act on a PR, regardless of who opened it. This
     lets a human author a plan PR by hand and hand it off by labeling.
+
+    Reviewers are filtered: only reviews from trusted associations count
+    (see SCHEMA["trusted_review_associations"]). A drive-by approval from
+    an unrelated account must not make a PR actionable.
     """
     prs = gh_json(
         "pr", "list", "--repo", repo,
         "--label", "bot:review-requested",
         "--json", "number,title,updatedAt,labels",
+        "--limit", "100",
     )
     actionable = []
     for pr in prs:
@@ -310,9 +325,14 @@ def check_review_requested(repo: str) -> list[dict]:
             "pr", "view", str(pr["number"]), "--repo", repo,
             "--json", "reviews,commits",
             "--jq",
-            "{last_review: .reviews[-1].submittedAt, last_commit: .commits[-1].committedDate}",
+            "{reviews: [.reviews[] | {at: .submittedAt, assoc: .authorAssociation}],"
+            " last_commit: .commits[-1].committedDate}",
         )
-        last_review = info.get("last_review")
+        trusted = [
+            r["at"] for r in info.get("reviews") or []
+            if r.get("at") and is_trusted_reviewer(r.get("assoc"))
+        ]
+        last_review = max(trusted, default=None)
         last_commit = info.get("last_commit")
         if last_review and last_commit and last_review > last_commit:
             actionable.append(pr)
@@ -336,6 +356,7 @@ def check_plan_feedback(repo: str) -> list[dict]:
         "pr", "list", "--repo", repo,
         "--label", "bot:plan-proposed",
         "--json", "number,title,headRefName,labels",
+        "--limit", "100",
     )
     actionable = []
     for pr in prs:
@@ -386,6 +407,7 @@ def check_accepted_plans(repo: str) -> list[dict]:
         "pr", "list", "--repo", repo,
         "--label", "bot:plan-accepted",
         "--json", "number,title,labels",
+        "--limit", "100",
     )
     return [pr for pr in prs if _has_label(pr, "bot:plan-accepted")]
 

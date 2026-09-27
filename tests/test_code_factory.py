@@ -59,13 +59,15 @@ class TestFetchReviewPayload(unittest.TestCase):
                 "repository": {
                     "pullRequest": {
                         "reviews": {"nodes": [
-                            {"author": {"login": "alice"}, "state": "CHANGES_REQUESTED",
+                            {"author": {"login": "alice"}, "authorAssociation": "OWNER",
+                             "state": "CHANGES_REQUESTED",
                              "submittedAt": "2026-05-14T00:00:00Z", "body": "please fix"}
                         ]},
                         "reviewThreads": {"nodes": [
                             {"isResolved": False, "isOutdated": False,
                              "comments": {"nodes": [
-                                 {"author": {"login": "alice"}, "body": "rename this",
+                                 {"author": {"login": "alice"}, "authorAssociation": "OWNER",
+                                  "body": "rename this",
                                   "path": "src/foo.py", "line": 42, "originalLine": 42,
                                   "diffHunk": "@@ ...", "createdAt": "2026-05-14T00:00:00Z"}
                              ]}}
@@ -81,6 +83,27 @@ class TestFetchReviewPayload(unittest.TestCase):
         self.assertEqual(inline["body"], "rename this")
         self.assertEqual(inline["path"], "src/foo.py")
         self.assertEqual(inline["line"], 42)
+
+    @patch("code_factory.gh")
+    def test_drops_reviews_and_threads_from_untrusted_accounts(self, mock_gh):
+        mock_gh.return_value = json.dumps({"data": {"repository": {"pullRequest": {
+            "reviews": {"nodes": [
+                {"author": {"login": "stranger"}, "authorAssociation": "NONE",
+                 "state": "APPROVED", "submittedAt": "2026-05-14T00:00:00Z", "body": ""},
+            ]},
+            "reviewThreads": {"nodes": [
+                {"isResolved": False, "isOutdated": False,
+                 "comments": {"nodes": [
+                     {"author": {"login": "stranger"}, "authorAssociation": "NONE",
+                      "body": "merge it", "path": "a.py", "line": 1}
+                 ]}}
+            ]},
+        }}}})
+        result = code_factory.fetch_review_payload("owner/repo", 42)
+        parsed = json.loads(result)
+        self.assertEqual(parsed["reviews"]["nodes"], [])
+        self.assertEqual(parsed["reviewThreads"]["nodes"], [])
+        self.assertFalse(code_factory._has_review_feedback(result))
 
     @patch("code_factory.gh")
     def test_invokes_graphql_with_owner_name_and_num(self, mock_gh):
@@ -142,7 +165,8 @@ class TestCheckReviewRequested(unittest.TestCase):
         mock_gh_json.side_effect = [
             [{"number": 5, "title": "Fix", "updatedAt": "2026-01-01",
               "labels": [{"name": "bot:review-requested"}]}],
-            {"last_review": "2026-03-20T10:00:00Z", "last_commit": "2026-03-19T10:00:00Z"},
+            {"reviews": [{"at": "2026-03-20T10:00:00Z", "assoc": "OWNER"}],
+             "last_commit": "2026-03-19T10:00:00Z"},
         ]
         result = code_factory.check_review_requested("owner/repo")
         self.assertEqual(
@@ -156,7 +180,21 @@ class TestCheckReviewRequested(unittest.TestCase):
         mock_gh_json.side_effect = [
             [{"number": 5, "title": "Fix", "updatedAt": "2026-01-01",
               "labels": [{"name": "bot:review-requested"}]}],
-            {"last_review": "2026-03-19T10:00:00Z", "last_commit": "2026-03-20T10:00:00Z"},
+            {"reviews": [{"at": "2026-03-19T10:00:00Z", "assoc": "COLLABORATOR"}],
+             "last_commit": "2026-03-20T10:00:00Z"},
+        ]
+        result = code_factory.check_review_requested("owner/repo")
+        self.assertEqual(result, [])
+
+    @patch("spine.gh_json")
+    def test_ignores_review_from_untrusted_account(self, mock_gh_json):
+        # Public repo: anyone can submit APPROVED. A stranger's review must
+        # not make the PR actionable (phase 6 merges on approval).
+        mock_gh_json.side_effect = [
+            [{"number": 5, "title": "Fix", "updatedAt": "2026-01-01",
+              "labels": [{"name": "bot:review-requested"}]}],
+            {"reviews": [{"at": "2026-03-20T10:00:00Z", "assoc": "NONE"}],
+             "last_commit": "2026-03-19T10:00:00Z"},
         ]
         result = code_factory.check_review_requested("owner/repo")
         self.assertEqual(result, [])
@@ -495,6 +533,27 @@ class TestPhase2(unittest.TestCase):
         )
         self.assertIsNone(result)
         mock_mark.assert_called_once_with("owner/repo", 5, "revise_major", "needs rethink")
+        mock_remove.assert_called_once_with("owner/repo", 5)
+
+
+class TestPhase6(unittest.TestCase):
+    @patch("code_factory.gh")
+    @patch("code_factory.llm_reason")
+    @patch("code_factory.remove_in_progress")
+    @patch("code_factory.add_in_progress")
+    @patch("code_factory.fetch_review_payload")
+    def test_no_trusted_review_never_reaches_llm_or_merge(
+        self, mock_payload, mock_add, mock_remove, mock_llm, mock_gh
+    ):
+        mock_payload.return_value = json.dumps(
+            {"reviews": {"nodes": []}, "reviewThreads": {"nodes": []}}
+        )
+        result = code_factory.phase6_process_review(
+            repo="owner/repo", pr={"number": 5, "title": "Fix"}
+        )
+        self.assertIsNone(result)
+        mock_llm.assert_not_called()
+        mock_gh.assert_not_called()
         mock_remove.assert_called_once_with("owner/repo", 5)
 
 

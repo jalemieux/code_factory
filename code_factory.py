@@ -35,6 +35,7 @@ from spine import (
     get_repo,
     gh,
     gh_json,
+    is_trusted_reviewer,
     log,
     open_plan_count,
     remove_in_progress,
@@ -111,6 +112,10 @@ def fetch_review_payload(repo: str, num: int) -> str:
     a `gh pr view` field at all (it's a GraphQL field on `pullRequest`).
     We need both — the prompt asks the LLM to reason about inline comments
     and unresolved threads, so we fetch them via GraphQL in one call.
+
+    Reviews and thread comments from untrusted accounts are dropped before
+    the payload reaches the LLM: on a public repo anyone can approve or
+    comment, and phase 6 merges on "approved".
     """
     owner, name = repo.split("/", 1)
     query = (
@@ -118,13 +123,13 @@ def fetch_review_payload(repo: str, num: int) -> str:
         "  repository(owner: $owner, name: $name) {"
         "    pullRequest(number: $num) {"
         "      reviews(first: 50) {"
-        "        nodes { author { login } state submittedAt body }"
+        "        nodes { author { login } authorAssociation state submittedAt body }"
         "      }"
         "      reviewThreads(first: 100) {"
         "        nodes {"
         "          isResolved isOutdated"
         "          comments(first: 50) {"
-        "            nodes { author { login } body path line originalLine diffHunk createdAt }"
+        "            nodes { author { login } authorAssociation body path line originalLine diffHunk createdAt }"
         "          }"
         "        }"
         "      }"
@@ -140,7 +145,33 @@ def fetch_review_payload(repo: str, num: int) -> str:
         "-F", f"num={num}",
     )
     pr_data = json.loads(raw).get("data", {}).get("repository", {}).get("pullRequest", {})
-    return json.dumps(pr_data, indent=2)
+    return json.dumps(_trusted_review_data(pr_data), indent=2)
+
+
+def _trusted_review_data(pr_data: dict) -> dict:
+    """Drop reviews and thread comments whose author isn't trusted."""
+    def trusted(nodes: list[dict]) -> list[dict]:
+        return [n for n in nodes if is_trusted_reviewer(n.get("authorAssociation"))]
+
+    if "reviews" in pr_data:
+        pr_data["reviews"]["nodes"] = trusted(pr_data["reviews"].get("nodes", []))
+    if "reviewThreads" in pr_data:
+        threads = []
+        for thread in pr_data["reviewThreads"].get("nodes", []):
+            comments = trusted(thread.get("comments", {}).get("nodes", []))
+            if comments:
+                thread["comments"]["nodes"] = comments
+                threads.append(thread)
+        pr_data["reviewThreads"]["nodes"] = threads
+    return pr_data
+
+
+def _has_review_feedback(reviews_json: str) -> bool:
+    data = json.loads(reviews_json)
+    return bool(
+        data.get("reviews", {}).get("nodes")
+        or data.get("reviewThreads", {}).get("nodes")
+    )
 
 
 def git(*args: str, cwd: str | None = None) -> str:
@@ -841,6 +872,10 @@ def phase6_process_review(repo: str, pr: dict) -> tuple[str, dict] | None:
     add_in_progress(repo, num)
 
     reviews = fetch_review_payload(repo, num)
+    if not _has_review_feedback(reviews):
+        log(f"Phase 6: no review from a trusted account on PR #{num}; nothing to do")
+        remove_in_progress(repo, num)
+        return None
 
     prompt = load_prompt(
         "phase6_process_review",
