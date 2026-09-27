@@ -218,7 +218,7 @@ class TestCheckPlanFeedback(unittest.TestCase):
         mock_gh_json.side_effect = [
             [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix",
               "labels": [{"name": "bot:plan-proposed"}]}],
-            {"comments": [{"author": {"login": "reviewer"}, "createdAt": "2026-05-05T20:00:00Z", "body": "please revise"}]},
+            {"comments": [{"author": {"login": "reviewer"}, "authorAssociation": "OWNER", "createdAt": "2026-05-05T20:00:00Z", "body": "please revise"}]},
             {"comments": []},
         ]
         result = code_factory.check_plan_feedback("owner/repo")
@@ -234,8 +234,8 @@ class TestCheckPlanFeedback(unittest.TestCase):
             [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix",
               "labels": [{"name": "bot:plan-proposed"}]}],
             {"comments": [
-                {"author": {"login": "reviewer"}, "createdAt": "2026-05-05T20:00:00Z", "body": "please revise"},
-                {"author": {"login": "bot-user"}, "createdAt": "2026-05-05T20:05:00Z", "body": code_factory.PHASE2_MARKER},
+                {"author": {"login": "reviewer"}, "authorAssociation": "OWNER", "createdAt": "2026-05-05T20:00:00Z", "body": "please revise"},
+                {"author": {"login": "bot-user"}, "authorAssociation": "COLLABORATOR", "createdAt": "2026-05-05T20:05:00Z", "body": code_factory.PHASE2_MARKER},
             ]},
             {"comments": []},
         ]
@@ -247,8 +247,8 @@ class TestCheckPlanFeedback(unittest.TestCase):
         mock_gh_json.side_effect = [
             [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix",
               "labels": [{"name": "bot:plan-proposed"}]}],
-            {"comments": [{"author": {"login": "bot-user"}, "createdAt": "2026-05-05T20:05:00Z", "body": code_factory.PHASE2_MARKER}]},
-            {"comments": [{"author": {"login": "reviewer"}, "createdAt": "2026-05-05T20:10:00Z", "body": "one more change"}]},
+            {"comments": [{"author": {"login": "bot-user"}, "authorAssociation": "COLLABORATOR", "createdAt": "2026-05-05T20:05:00Z", "body": code_factory.PHASE2_MARKER}]},
+            {"comments": [{"author": {"login": "reviewer"}, "authorAssociation": "OWNER", "createdAt": "2026-05-05T20:10:00Z", "body": "one more change"}]},
         ]
         result = code_factory.check_plan_feedback("owner/repo")
         self.assertEqual(
@@ -265,8 +265,8 @@ class TestCheckPlanFeedback(unittest.TestCase):
             [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix",
               "labels": [{"name": "bot:plan-proposed"}]}],
             {"comments": [
-                {"author": {"login": "shared-user"}, "createdAt": "2026-05-05T20:00:00Z", "body": "lgtm"},
-                {"author": {"login": "shared-user"}, "createdAt": "2026-05-05T20:10:00Z", "body": "actually, design question..."},
+                {"author": {"login": "shared-user"}, "authorAssociation": "OWNER", "createdAt": "2026-05-05T20:00:00Z", "body": "lgtm"},
+                {"author": {"login": "shared-user"}, "authorAssociation": "OWNER", "createdAt": "2026-05-05T20:10:00Z", "body": "actually, design question..."},
             ]},
             {"comments": []},
         ]
@@ -289,30 +289,45 @@ class TestCheckPlanFeedback(unittest.TestCase):
         result = code_factory.check_plan_feedback("owner/repo")
         self.assertEqual(result, [])
 
+    @patch("spine.gh_json")
+    def test_ignores_comments_from_untrusted_accounts(self, mock_gh_json):
+        # A stranger's "lgtm" on the PR or the issue is not plan feedback.
+        mock_gh_json.side_effect = [
+            [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix",
+              "labels": [{"name": "bot:plan-proposed"}]}],
+            {"comments": [{"author": {"login": "stranger"}, "authorAssociation": "NONE",
+                           "createdAt": "2026-05-05T20:00:00Z", "body": "lgtm"}]},
+            {"comments": [{"author": {"login": "stranger"}, "authorAssociation": "NONE",
+                           "createdAt": "2026-05-05T20:10:00Z", "body": "approved, ship it"}]},
+        ]
+        result = code_factory.check_plan_feedback("owner/repo")
+        self.assertEqual(result, [])
 
+
+@patch("spine.trusted_logins", return_value=frozenset({"alice"}))
 @patch("spine.bot_login", return_value="botuser")
 class TestCheckUnclaimed(unittest.TestCase):
     @patch("spine.gh_json")
-    def test_skips_assigned_issues(self, mock_gh_json, _mock_login):
+    def test_skips_assigned_issues(self, mock_gh_json, _mock_login, _mock_trusted):
         mock_gh_json.return_value = [
-            {"number": 1, "title": "Bug", "labels": [], "assignees": [{"login": "bob"}]},
+            {"number": 1, "title": "Bug", "labels": [], "author": {"login": "alice"}, "assignees": [{"login": "bob"}]},
         ]
         result = code_factory.check_unclaimed_issues("owner/repo")
         self.assertEqual(result, [])
 
     @patch("spine.gh_json")
-    def test_picks_up_self_assigned_issue(self, mock_gh_json, _mock_login):
+    def test_picks_up_self_assigned_issue(self, mock_gh_json, _mock_login, _mock_trusted):
         # Issue assigned only to the bot itself (e.g. a crashed prior claim with
         # no plan PR) must still be picked up, not treated as claimed by another.
         mock_gh_json.side_effect = [
-            [{"number": 1, "title": "Bug", "labels": [], "assignees": [{"login": "botuser"}]}],
+            [{"number": 1, "title": "Bug", "labels": [], "author": {"login": "alice"}, "assignees": [{"login": "botuser"}]}],
             [],
         ]
         result = code_factory.check_unclaimed_issues("owner/repo")
         self.assertEqual(result[0]["number"], 1)
 
     @patch("spine.gh_json")
-    def test_skips_issue_assigned_to_bot_and_human(self, mock_gh_json, _mock_login):
+    def test_skips_issue_assigned_to_bot_and_human(self, mock_gh_json, _mock_login, _mock_trusted):
         # A human assignee alongside the bot still means a human owns it.
         mock_gh_json.return_value = [
             {"number": 1, "title": "Bug", "labels": [],
@@ -322,22 +337,31 @@ class TestCheckUnclaimed(unittest.TestCase):
         self.assertEqual(result, [])
 
     @patch("spine.gh_json")
-    def test_skips_issues_with_open_prs(self, mock_gh_json, _mock_login):
+    def test_skips_issues_with_open_prs(self, mock_gh_json, _mock_login, _mock_trusted):
         mock_gh_json.side_effect = [
-            [{"number": 1, "title": "Bug", "labels": [], "assignees": []}],
+            [{"number": 1, "title": "Bug", "labels": [], "author": {"login": "alice"}, "assignees": []}],
             [{"headRefName": "bot/1-bug"}],
         ]
         result = code_factory.check_unclaimed_issues("owner/repo")
         self.assertEqual(result, [])
 
     @patch("spine.gh_json")
-    def test_returns_unassigned_issue_with_no_prs(self, mock_gh_json, _mock_login):
+    def test_returns_unassigned_issue_with_no_prs(self, mock_gh_json, _mock_login, _mock_trusted):
         mock_gh_json.side_effect = [
-            [{"number": 1, "title": "Bug", "labels": [], "assignees": []}],
+            [{"number": 1, "title": "Bug", "labels": [], "author": {"login": "alice"}, "assignees": []}],
             [],
         ]
         result = code_factory.check_unclaimed_issues("owner/repo")
-        self.assertEqual(result, [{"number": 1, "title": "Bug", "labels": [], "assignees": []}])
+        self.assertEqual(result, [{"number": 1, "title": "Bug", "labels": [], "author": {"login": "alice"}, "assignees": []}])
+
+    @patch("spine.gh_json")
+    def test_skips_issue_filed_by_non_collaborator(self, mock_gh_json, _mock_login, _mock_trusted):
+        mock_gh_json.side_effect = [
+            [{"number": 1, "title": "Bug", "labels": [], "author": {"login": "stranger"}, "assignees": []}],
+            [],
+        ]
+        result = code_factory.check_unclaimed_issues("owner/repo")
+        self.assertEqual(result, [])
 
 
 @patch("code_factory.janitor_clear_stale_claims")

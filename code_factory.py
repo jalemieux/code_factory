@@ -19,6 +19,7 @@ from pathlib import Path
 # this file keeps the phase logic and drives them.
 from spine import (
     PHASE2_MARKER,
+    TRUSTED_COMMENTS_JQ,
     WIP_LIMIT,
     _fmt_argv,
     _issue_num_from_branch,
@@ -672,7 +673,7 @@ def phase1_claim_and_plan(repo: str, issue: dict) -> tuple[str, dict] | None:
     issue_comments = gh(
         "issue", "view", str(num), "--repo", repo,
         "--json", "comments",
-        "--jq", r'.comments[] | "\(.author.login) (\(.createdAt)): \(.body)"',
+        "--jq", TRUSTED_COMMENTS_JQ,
     ) or "(none)"
     root = _repo_root()
     conventions = read_repo_conventions(repo, cwd=root)
@@ -742,7 +743,7 @@ def phase2_process_feedback(repo: str, pr: dict) -> tuple[str, dict] | None:
     pr_comments = gh(
         "pr", "view", str(num), "--repo", repo,
         "--json", "comments",
-        "--jq", r'.comments[] | "\(.author.login) (\(.createdAt)): \(.body)"',
+        "--jq", TRUSTED_COMMENTS_JQ,
     )
     plan_body = gh("pr", "view", str(num), "--repo", repo, "--json", "body", "-q", ".body")
 
@@ -755,7 +756,7 @@ def phase2_process_feedback(repo: str, pr: dict) -> tuple[str, dict] | None:
             issue_comments = gh(
                 "issue", "view", str(issue_num), "--repo", repo,
                 "--json", "comments",
-                "--jq", r'.comments[] | "\(.author.login) (\(.createdAt)): \(.body)"',
+                "--jq", TRUSTED_COMMENTS_JQ,
             )
             if issue_comments:
                 parts.append(f"### Comments on linked issue #{issue_num}\n{issue_comments}")

@@ -141,6 +141,26 @@ def is_trusted_reviewer(author_association: str | None) -> bool:
     """True when a review/comment author may influence a PR's state."""
     return author_association in TRUSTED_REVIEW_ASSOCIATIONS
 
+
+# jq fragment: render only trusted authors' comments for an LLM prompt.
+TRUSTED_COMMENTS_JQ = (
+    ".comments[] | select(.authorAssociation | IN("
+    + ", ".join(f'"{a}"' for a in TRUSTED_REVIEW_ASSOCIATIONS)
+    + r')) | "\(.author.login) (\(.createdAt)): \(.body)"'
+)
+
+
+@lru_cache(maxsize=None)
+def trusted_logins(repo: str) -> frozenset[str]:
+    """Accounts allowed to file work for the bot: the repo's collaborators.
+
+    `gh issue list` carries no authorAssociation, so issue authors are
+    checked against this set instead. Cached — it can't change mid-run.
+    """
+    return frozenset(json.loads(gh(
+        "api", f"repos/{repo}/collaborators", "--paginate", "--jq", "[.[].login]",
+    ) or "[]"))
+
 # Strictest first — used to resolve mixed-tier diffs.
 TIERS = ("A", "B", "C")
 
@@ -351,6 +371,9 @@ def check_plan_feedback(repo: str) -> list[dict]:
     `author.login` — when the bot runs as the human user (same gh account),
     every comment shares the same login, so the marker is the only reliable
     signal that a comment came from the bot.
+
+    Comments from untrusted accounts are ignored entirely: a stranger's
+    "lgtm" on a public repo must not read as plan approval.
     """
     prs = gh_json(
         "pr", "list", "--repo", repo,
@@ -387,6 +410,8 @@ def check_plan_feedback(repo: str) -> list[dict]:
             created_at = comment.get("createdAt")
             body = comment.get("body") or ""
             if not created_at:
+                continue
+            if not is_trusted_reviewer(comment.get("authorAssociation")):
                 continue
             if PHASE2_MARKER in body:
                 if latest_marker is None or created_at > latest_marker:
@@ -425,11 +450,14 @@ def check_unclaimed_issues(repo: str) -> list[dict]:
     two steps would otherwise strand the issue — assigned-to-self but with no
     PR, invisible to both the assignee filter and the branch dedup. We skip
     only issues assigned to *someone else*, which is a human claiming the work.
+
+    Only issues filed by a collaborator are claimable — on a public repo
+    anyone can open an issue, and an issue becomes a plan and then code.
     """
     issues = gh_json(
         "issue", "list", "--repo", repo,
         "--state", "open",
-        "--json", "number,title,labels,assignees",
+        "--json", "number,title,labels,assignees,author",
         "--limit", "20",
     )
     open_bot_prs = gh_json(
@@ -445,8 +473,11 @@ def check_unclaimed_issues(repo: str) -> list[dict]:
             claimed_nums.add(n)
 
     me = bot_login()
+    trusted = trusted_logins(repo)
     actionable = []
     for issue in issues:
+        if (issue.get("author") or {}).get("login") not in trusted:
+            continue
         others = [a for a in issue.get("assignees", []) if a.get("login") != me]
         if others:
             continue
