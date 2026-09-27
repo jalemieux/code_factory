@@ -237,7 +237,9 @@ class Worktree:
 
     Enter: `git worktree prune` (clears stale entries from crashed workers),
     then `git worktree add` under `<repo_root>/.worktrees/` on <branch>,
-    creating the branch from `origin/<branch>` (or HEAD) if needed.
+    creating the branch from `origin/<branch>` (or HEAD) if needed. Pass
+    `base` to cut a new branch from that ref instead — HEAD is whatever the
+    main clone happens to have checked out, which is no basis for new work.
 
     Exit: hard-gated cleanup per spike 0.1 (dev_stack notes/spike-01):
     `worktree remove` alone is recoverable (the branch ref survives in the
@@ -254,9 +256,10 @@ class Worktree:
     worktree is left for inspection) and the original exception propagates.
     """
 
-    def __init__(self, repo_root: str, branch: str):
+    def __init__(self, repo_root: str, branch: str, base: str | None = None):
         self.repo_root = os.path.abspath(repo_root)
         self.branch = branch
+        self.base = base
         self.path = os.path.join(self.repo_root, ".worktrees", branch.replace("/", "-"))
 
     def _ref_exists(self, ref: str) -> bool:
@@ -271,6 +274,14 @@ class Worktree:
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         if self._ref_exists(f"refs/heads/{self.branch}"):
             git_retry("worktree", "add", self.path, self.branch, cwd=self.repo_root)
+        elif self.base:
+            git_retry(
+                # --no-track: starting from a remote ref would otherwise
+                # make it the upstream, so the cleanup gate would measure
+                # against the base instead of the pushed branch.
+                "worktree", "add", "--no-track", "-b", self.branch, self.path,
+                self.base, cwd=self.repo_root,
+            )
         elif self._ref_exists(f"refs/remotes/origin/{self.branch}"):
             git_retry(
                 "worktree", "add", "-b", self.branch, self.path,
@@ -476,12 +487,13 @@ def _codex(
         return tmp.read().strip()
 
 
-def llm_reason(prompt: str, log_name: str | None = None) -> str:
+def llm_reason(prompt: str, log_name: str | None = None, workdir: str | None = None) -> str:
     """Run the configured agent CLI for reasoning tasks."""
     if AGENT_CLI == "codex":
-        return _codex(prompt, log_name=log_name)
+        return _codex(prompt, workdir=workdir, log_name=log_name)
     raw = _run_agent_command(
         ["claude", "-p", prompt, "--print", "--output-format", "stream-json", "--verbose"],
+        cwd=workdir,
         log_path=_log_path(log_name),
     )
     return _claude_result_from_stream(raw)
@@ -676,7 +688,6 @@ def phase1_claim_and_plan(repo: str, issue: dict) -> tuple[str, dict] | None:
         "--jq", TRUSTED_COMMENTS_JQ,
     ) or "(none)"
     root = _repo_root()
-    conventions = read_repo_conventions(repo, cwd=root)
     recent_prs = gh(
         "pr", "list", "--repo", repo, "--state", "merged",
         "--limit", "5", "--json", "title,body",
@@ -685,8 +696,15 @@ def phase1_claim_and_plan(repo: str, issue: dict) -> tuple[str, dict] | None:
     slug = slugify(title)
     branch = f"bot/{num}-{slug}"
     default_branch = gh("repo", "view", repo, "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name")
-    git("checkout", default_branch, cwd=root)
-    git("pull", "--ff-only", cwd=root)
+    # The main clone is never checked out or pulled here — the plan branch
+    # is cut from the freshly fetched default branch, inside a worktree.
+    git_retry("fetch", "origin", default_branch, cwd=root)
+    # A worktree left by a failed earlier attempt holds only the empty plan
+    # commit; clear it through the usual gate, which refuses (loudly) if it
+    # is dirty or holds unpushed work.
+    stale = Worktree(root, branch)
+    if os.path.isdir(stale.path):
+        stale.cleanup()
     # Clean up stale local branch from a previous failed run
     try:
         git("branch", "-D", branch, cwd=root)
@@ -699,22 +717,26 @@ def phase1_claim_and_plan(repo: str, issue: dict) -> tuple[str, dict] | None:
         git("push", "origin", "--delete", branch, cwd=root)
     except RuntimeError:
         pass
-    git("checkout", "-b", branch, cwd=root)
-    git("commit", "--allow-empty", "-m", f"plan: {title} (#{num})", cwd=root)
-    # Explicit refspec, no -u: upstream tracking writes shared .git/config,
-    # which contends across concurrent worktree workers (spike 0.1).
-    git_retry("push", "origin", f"HEAD:{branch}", cwd=root)
+    with Worktree(root, branch, base=f"origin/{default_branch}") as wt:
+        git("commit", "--allow-empty", "-m", f"plan: {title} (#{num})", cwd=wt.path)
+        # Explicit refspec, no -u: upstream tracking writes shared .git/config,
+        # which contends across concurrent worktree workers (spike 0.1).
+        git_retry("push", "origin", f"HEAD:{branch}", cwd=wt.path)
 
-    prompt = load_prompt(
-        "phase1_claim_and_plan",
-        issue_number=str(num),
-        issue_title=title,
-        issue_body=issue_body or "(no description)",
-        issue_comments=issue_comments,
-        conventions=conventions,
-        recent_prs=recent_prs,
-    )
-    plan = llm_reason(prompt, log_name=f"issue-{num}-phase1_claim_and_plan")
+        prompt = load_prompt(
+            "phase1_claim_and_plan",
+            issue_number=str(num),
+            issue_title=title,
+            issue_body=issue_body or "(no description)",
+            issue_comments=issue_comments,
+            conventions=read_repo_conventions(repo, cwd=wt.path),
+            recent_prs=recent_prs,
+        )
+        # Plan against the default branch's code, not whatever the main
+        # clone has checked out.
+        plan = llm_reason(
+            prompt, log_name=f"issue-{num}-phase1_claim_and_plan", workdir=wt.path,
+        )
     plan_body = _strip_outer_fence(plan)
     # Always append `Closes #N` on its own line, outside any fence, so GitHub
     # links the PR to the issue (the LLM often buries it inside a code block).

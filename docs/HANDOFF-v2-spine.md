@@ -112,6 +112,49 @@ Phase spellings accepted by `--phase`: `4`, `phase4`, or
 - `.worktrees/` is gitignored and was empty at handoff. If you find
   leftovers, that is a refused cleanup: inspect before removing.
 
+## Update 2026-09-27
+
+Three commits added after the handoff (`d172de4`, `8815863`, `63c4c41`):
+test isolation and pytest scoping, and trust filters so the bot only acts
+on reviews, comments and issues from repo collaborators. The first two
+gotchas below (nested clones breaking bare `pytest`, stale
+`failure_counts.json`) are fixed.
+
+**Task 2.5 is done, on a throwaway repo.** Curunir had no genuine work
+queued, so the smoke ran against the private repo
+`toddsmartlayer-byte/factory-smoke` (safe to delete). Two `run --pr N
+--phase 2` workers ran at the same time; each chained phase 2, 4 and 5.
+
+- Both exited 0 in about 80 seconds, with both worktrees live at once.
+- Labels moved `bot:plan-proposed` to `bot:review-requested`; both PRs
+  left draft; no `bot:in-progress` or `bot:failed` left behind.
+- No cross-talk: each PR holds only its own feature, each log mentions
+  only its own feature, and tests pass on both branches.
+- The main clone sat on a side branch with a modified file and an
+  untracked file throughout. HEAD, branch and every file hash were
+  identical afterwards. `.worktrees/` was empty.
+
+Findings from the run:
+
+- **Phase 1 was not isolated; now it is.** It used to check out and pull
+  the default branch in the main clone and leave the clone on the new
+  `bot/` branch. It now fetches the default branch and cuts the plan
+  branch from `origin/<default>` inside a worktree (`Worktree(base=...)`),
+  and the planner runs there. Verified with two concurrent `run --issue`
+  workers on the smoke repo: both exit 0, main clone byte-identical.
+  A retry after a failed planner clears the leftover worktree through the
+  usual cleanup gate.
+- Worktree cleanup deletes the local `bot/` branches from the main clone
+  once the push is verified. This is by design, but it is a change to the
+  clone's refs.
+- The curunir run is still owed: repeat the smoke there once two plans
+  have real approvals.
+
+Curunir itself now has an interaction limit of collaborators only
+(expires 2027-03-27), and `main` has branch protection requiring one
+approval from a user with write access, admins exempt. The bot token
+cannot read that protection and gets a 404.
+
 ## Next steps, per the plan
 
 1. **Task 2.5, two-worker smoke.** With the bot `.env` in place, run two

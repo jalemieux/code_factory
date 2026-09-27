@@ -152,6 +152,19 @@ class WorktreeTestCase(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             Worktree(self.clone, "bot/9-iota").__enter__()
 
+    def test_base_cuts_new_branch_from_that_ref_not_head(self):
+        # The main clone sits on a side branch with its own commit; new work
+        # must start from origin/main, not from wherever HEAD happens to be.
+        _git(self.clone, "checkout", "-b", "human/side")
+        self._commit_file(self.clone, "side.txt")
+        with Worktree(self.clone, "bot/11-lambda", base="origin/main") as wt:
+            self.assertEqual(
+                _git(wt.path, "rev-parse", "HEAD"),
+                _git(self.clone, "rev-parse", "origin/main"),
+            )
+            self.assertFalse((Path(wt.path) / "side.txt").exists())
+            _git(wt.path, "push", "origin", "HEAD:bot/11-lambda")
+
     def test_main_clone_checkout_untouched(self):
         before = _git(self.clone, "rev-parse", "HEAD")
         with Worktree(self.clone, "bot/10-kappa") as wt:
@@ -160,6 +173,87 @@ class WorktreeTestCase(unittest.TestCase):
         self.assertEqual(_git(self.clone, "rev-parse", "HEAD"), before)
         self.assertEqual(_git(self.clone, "branch", "--show-current"), "main")
         self.assertEqual(_git(self.clone, "status", "--porcelain"), "")
+
+
+class Phase1IsolationTestCase(WorktreeTestCase):
+    """Phase 1 against the scratch repo, with gh and the agent faked."""
+
+    def _fake_gh(self, *args: str) -> str:
+        if args[:2] == ("repo", "view"):
+            return "main"
+        if args[:2] == ("pr", "create"):
+            return "https://github.com/o/r/pull/7"
+        return ""
+
+    def _run_phase1(self, llm=None):
+        seen = {}
+
+        def fake_llm(prompt, log_name=None, workdir=None):
+            seen["workdir"] = workdir
+            seen["branch"] = _git(workdir, "branch", "--show-current")
+            if llm:
+                llm()
+            return "## Problem\nplan"
+
+        patches = [
+            unittest.mock.patch("code_factory.gh", side_effect=self._fake_gh),
+            unittest.mock.patch("code_factory.bot_login", return_value="bot"),
+            unittest.mock.patch("code_factory.ensure_labels"),
+            unittest.mock.patch("code_factory.add_label"),
+            unittest.mock.patch("code_factory.llm_reason", side_effect=fake_llm),
+            unittest.mock.patch.object(code_factory, "REPO_ROOT", self.clone),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        code_factory.phase1_claim_and_plan(
+            repo="o/r", issue={"number": 12, "title": "Add thing"}
+        )
+        return seen
+
+    def test_phase1_leaves_a_dirty_main_clone_untouched(self):
+        _git(self.clone, "checkout", "-b", "human/side")
+        self._commit_file(self.clone, "side.txt")
+        (Path(self.clone) / "README.md").write_text("edited by a human\n")
+        (Path(self.clone) / "notes.txt").write_text("untracked\n")
+        head = _git(self.clone, "rev-parse", "HEAD")
+        status = _git(self.clone, "status", "--porcelain")
+
+        seen = self._run_phase1()
+
+        self.assertEqual(_git(self.clone, "branch", "--show-current"), "human/side")
+        self.assertEqual(_git(self.clone, "rev-parse", "HEAD"), head)
+        self.assertEqual(_git(self.clone, "status", "--porcelain"), status)
+        # The planner ran inside the worktree, on the plan branch.
+        self.assertIn(os.sep + ".worktrees" + os.sep, seen["workdir"])
+        self.assertEqual(seen["branch"], "bot/12-add-thing")
+        # The plan commit is on the remote, cut from main (no side.txt).
+        self.assertEqual(
+            _git(self.origin, "log", "-1", "--format=%s", "bot/12-add-thing"),
+            "plan: Add thing (#12)",
+        )
+        self.assertEqual(
+            _git(self.origin, "rev-parse", "bot/12-add-thing~1"),
+            _git(self.origin, "rev-parse", "main"),
+        )
+        # Worktree and local branch are gone.
+        self.assertFalse(os.path.isdir(seen["workdir"]))
+        self.assertFalse(self._branch_exists("bot/12-add-thing"))
+
+    def test_phase1_retry_recovers_from_a_failed_planner(self):
+        def boom():
+            raise RuntimeError("planner timed out")
+
+        with self.assertRaises(RuntimeError):
+            self._run_phase1(llm=boom)
+        # The failed attempt left its worktree behind for inspection.
+        self.assertTrue(
+            os.path.isdir(os.path.join(self.clone, ".worktrees", "bot-12-add-thing"))
+        )
+        unittest.mock.patch.stopall()
+        seen = self._run_phase1()
+        self.assertFalse(os.path.isdir(seen["workdir"]))
+        self.assertEqual(_git(self.clone, "branch", "--show-current"), "main")
 
 
 class GitRetryTestCase(unittest.TestCase):

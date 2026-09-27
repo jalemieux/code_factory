@@ -594,6 +594,7 @@ class TestAgentSelection(unittest.TestCase):
         self.assertEqual(result, "ok")
         mock_run.assert_called_once_with(
             ["claude", "-p", "prompt", "--print", "--output-format", "stream-json", "--verbose"],
+            cwd=None,
             log_path=None,
         )
 
@@ -607,7 +608,7 @@ class TestAgentSelection(unittest.TestCase):
         finally:
             code_factory.AGENT_CLI = original
         self.assertEqual(result, "ok")
-        mock_codex.assert_called_once_with("prompt", log_name=None)
+        mock_codex.assert_called_once_with("prompt", workdir=None, log_name=None)
 
     @patch("code_factory._run_agent_command")
     def test_llm_interactive_uses_claude(self, mock_run):
