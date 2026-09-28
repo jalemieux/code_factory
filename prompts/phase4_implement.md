@@ -31,11 +31,12 @@ Follow this process:
 
 5. **Commit and push** — Make focused commits with clear messages. Push all commits to the branch:
    ```
-   git push origin {branch}
+   git push origin HEAD:{branch}
    ```
 
 Important:
 - Follow the repo's existing patterns and test framework
 - Do not introduce new dependencies unless the plan explicitly calls for them
 - Do not force-push — it destroys review context
+- Push exactly as shown above (explicit refspec); never use `-u`/`--set-upstream` — upstream tracking writes shared git config that contends across concurrent worktrees
 - Every commit should leave the repo in a working state

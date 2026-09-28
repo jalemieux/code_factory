@@ -1,3 +1,7 @@
 __pycache__/
 .worktrees/
 .env
+logs/
+# target-repo clones made by bootstrap_repo when run from this checkout
+curunir/
+curunir-evals/

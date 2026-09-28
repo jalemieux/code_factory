@@ -9,7 +9,7 @@ import code_factory
 
 
 class TestGh(unittest.TestCase):
-    @patch("code_factory.subprocess.run")
+    @patch("spine.subprocess.run")
     def test_gh_returns_stdout_on_success(self, mock_run):
         mock_run.return_value = MagicMock(returncode=0, stdout="  output\n", stderr="")
         result = code_factory.gh("repo", "view")
@@ -18,15 +18,15 @@ class TestGh(unittest.TestCase):
             ["gh", "repo", "view"], capture_output=True, text=True
         )
 
-    @patch("code_factory.subprocess.run")
+    @patch("spine.subprocess.run")
     def test_gh_raises_on_non_rate_limit_error(self, mock_run):
         mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="not found")
         with self.assertRaises(RuntimeError) as ctx:
             code_factory.gh("repo", "view")
         self.assertIn("not found", str(ctx.exception))
 
-    @patch("code_factory.time.sleep")
-    @patch("code_factory.subprocess.run")
+    @patch("spine.time.sleep")
+    @patch("spine.subprocess.run")
     def test_gh_retries_on_rate_limit(self, mock_run, mock_sleep):
         fail = MagicMock(returncode=1, stdout="", stderr="API rate limit exceeded")
         success = MagicMock(returncode=0, stdout="ok", stderr="")
@@ -38,13 +38,13 @@ class TestGh(unittest.TestCase):
 
 
 class TestGhJson(unittest.TestCase):
-    @patch("code_factory.gh")
+    @patch("spine.gh")
     def test_gh_json_parses_list(self, mock_gh):
         mock_gh.return_value = '[{"number": 1}]'
         result = code_factory.gh_json("pr", "list")
         self.assertEqual(result, [{"number": 1}])
 
-    @patch("code_factory.gh")
+    @patch("spine.gh")
     def test_gh_json_returns_empty_list_for_empty_string(self, mock_gh):
         mock_gh.return_value = ""
         result = code_factory.gh_json("pr", "list")
@@ -59,13 +59,15 @@ class TestFetchReviewPayload(unittest.TestCase):
                 "repository": {
                     "pullRequest": {
                         "reviews": {"nodes": [
-                            {"author": {"login": "alice"}, "state": "CHANGES_REQUESTED",
+                            {"author": {"login": "alice"}, "authorAssociation": "OWNER",
+                             "state": "CHANGES_REQUESTED",
                              "submittedAt": "2026-05-14T00:00:00Z", "body": "please fix"}
                         ]},
                         "reviewThreads": {"nodes": [
                             {"isResolved": False, "isOutdated": False,
                              "comments": {"nodes": [
-                                 {"author": {"login": "alice"}, "body": "rename this",
+                                 {"author": {"login": "alice"}, "authorAssociation": "OWNER",
+                                  "body": "rename this",
                                   "path": "src/foo.py", "line": 42, "originalLine": 42,
                                   "diffHunk": "@@ ...", "createdAt": "2026-05-14T00:00:00Z"}
                              ]}}
@@ -81,6 +83,27 @@ class TestFetchReviewPayload(unittest.TestCase):
         self.assertEqual(inline["body"], "rename this")
         self.assertEqual(inline["path"], "src/foo.py")
         self.assertEqual(inline["line"], 42)
+
+    @patch("code_factory.gh")
+    def test_drops_reviews_and_threads_from_untrusted_accounts(self, mock_gh):
+        mock_gh.return_value = json.dumps({"data": {"repository": {"pullRequest": {
+            "reviews": {"nodes": [
+                {"author": {"login": "stranger"}, "authorAssociation": "NONE",
+                 "state": "APPROVED", "submittedAt": "2026-05-14T00:00:00Z", "body": ""},
+            ]},
+            "reviewThreads": {"nodes": [
+                {"isResolved": False, "isOutdated": False,
+                 "comments": {"nodes": [
+                     {"author": {"login": "stranger"}, "authorAssociation": "NONE",
+                      "body": "merge it", "path": "a.py", "line": 1}
+                 ]}}
+            ]},
+        }}}})
+        result = code_factory.fetch_review_payload("owner/repo", 42)
+        parsed = json.loads(result)
+        self.assertEqual(parsed["reviews"]["nodes"], [])
+        self.assertEqual(parsed["reviewThreads"]["nodes"], [])
+        self.assertFalse(code_factory._has_review_feedback(result))
 
     @patch("code_factory.gh")
     def test_invokes_graphql_with_owner_name_and_num(self, mock_gh):
@@ -137,12 +160,13 @@ class TestLoadPrompt(unittest.TestCase):
 
 
 class TestCheckReviewRequested(unittest.TestCase):
-    @patch("code_factory.gh_json")
+    @patch("spine.gh_json")
     def test_returns_pr_when_review_newer_than_commit(self, mock_gh_json):
         mock_gh_json.side_effect = [
             [{"number": 5, "title": "Fix", "updatedAt": "2026-01-01",
               "labels": [{"name": "bot:review-requested"}]}],
-            {"last_review": "2026-03-20T10:00:00Z", "last_commit": "2026-03-19T10:00:00Z"},
+            {"reviews": [{"at": "2026-03-20T10:00:00Z", "assoc": "OWNER"}],
+             "last_commit": "2026-03-19T10:00:00Z"},
         ]
         result = code_factory.check_review_requested("owner/repo")
         self.assertEqual(
@@ -151,17 +175,31 @@ class TestCheckReviewRequested(unittest.TestCase):
               "labels": [{"name": "bot:review-requested"}]}],
         )
 
-    @patch("code_factory.gh_json")
+    @patch("spine.gh_json")
     def test_skips_pr_when_commit_newer_than_review(self, mock_gh_json):
         mock_gh_json.side_effect = [
             [{"number": 5, "title": "Fix", "updatedAt": "2026-01-01",
               "labels": [{"name": "bot:review-requested"}]}],
-            {"last_review": "2026-03-19T10:00:00Z", "last_commit": "2026-03-20T10:00:00Z"},
+            {"reviews": [{"at": "2026-03-19T10:00:00Z", "assoc": "COLLABORATOR"}],
+             "last_commit": "2026-03-20T10:00:00Z"},
         ]
         result = code_factory.check_review_requested("owner/repo")
         self.assertEqual(result, [])
 
-    @patch("code_factory.gh_json")
+    @patch("spine.gh_json")
+    def test_ignores_review_from_untrusted_account(self, mock_gh_json):
+        # Public repo: anyone can submit APPROVED. A stranger's review must
+        # not make the PR actionable (phase 6 merges on approval).
+        mock_gh_json.side_effect = [
+            [{"number": 5, "title": "Fix", "updatedAt": "2026-01-01",
+              "labels": [{"name": "bot:review-requested"}]}],
+            {"reviews": [{"at": "2026-03-20T10:00:00Z", "assoc": "NONE"}],
+             "last_commit": "2026-03-19T10:00:00Z"},
+        ]
+        result = code_factory.check_review_requested("owner/repo")
+        self.assertEqual(result, [])
+
+    @patch("spine.gh_json")
     def test_skips_pr_when_search_index_is_stale(self, mock_gh_json):
         # gh's label search is eventually consistent — it can return a PR whose
         # actual labels no longer include the filter. Don't trust the search.
@@ -175,12 +213,12 @@ class TestCheckReviewRequested(unittest.TestCase):
 
 class TestCheckPlanFeedback(unittest.TestCase):
     # `gh ... --json comments` returns {"comments": [...]}, not a bare list — match real shape.
-    @patch("code_factory.gh_json")
+    @patch("spine.gh_json")
     def test_returns_pr_when_human_comment_has_no_marker(self, mock_gh_json):
         mock_gh_json.side_effect = [
             [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix",
               "labels": [{"name": "bot:plan-proposed"}]}],
-            {"comments": [{"author": {"login": "reviewer"}, "createdAt": "2026-05-05T20:00:00Z", "body": "please revise"}]},
+            {"comments": [{"author": {"login": "reviewer"}, "authorAssociation": "OWNER", "createdAt": "2026-05-05T20:00:00Z", "body": "please revise"}]},
             {"comments": []},
         ]
         result = code_factory.check_plan_feedback("owner/repo")
@@ -190,27 +228,27 @@ class TestCheckPlanFeedback(unittest.TestCase):
               "labels": [{"name": "bot:plan-proposed"}], "issue_number": 42}],
         )
 
-    @patch("code_factory.gh_json")
+    @patch("spine.gh_json")
     def test_skips_pr_when_marker_is_newer_than_human_comment(self, mock_gh_json):
         mock_gh_json.side_effect = [
             [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix",
               "labels": [{"name": "bot:plan-proposed"}]}],
             {"comments": [
-                {"author": {"login": "reviewer"}, "createdAt": "2026-05-05T20:00:00Z", "body": "please revise"},
-                {"author": {"login": "bot-user"}, "createdAt": "2026-05-05T20:05:00Z", "body": code_factory.PHASE2_MARKER},
+                {"author": {"login": "reviewer"}, "authorAssociation": "OWNER", "createdAt": "2026-05-05T20:00:00Z", "body": "please revise"},
+                {"author": {"login": "bot-user"}, "authorAssociation": "COLLABORATOR", "createdAt": "2026-05-05T20:05:00Z", "body": code_factory.PHASE2_MARKER},
             ]},
             {"comments": []},
         ]
         result = code_factory.check_plan_feedback("owner/repo")
         self.assertEqual(result, [])
 
-    @patch("code_factory.gh_json")
+    @patch("spine.gh_json")
     def test_returns_pr_when_issue_comment_is_newer_than_marker(self, mock_gh_json):
         mock_gh_json.side_effect = [
             [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix",
               "labels": [{"name": "bot:plan-proposed"}]}],
-            {"comments": [{"author": {"login": "bot-user"}, "createdAt": "2026-05-05T20:05:00Z", "body": code_factory.PHASE2_MARKER}]},
-            {"comments": [{"author": {"login": "reviewer"}, "createdAt": "2026-05-05T20:10:00Z", "body": "one more change"}]},
+            {"comments": [{"author": {"login": "bot-user"}, "authorAssociation": "COLLABORATOR", "createdAt": "2026-05-05T20:05:00Z", "body": code_factory.PHASE2_MARKER}]},
+            {"comments": [{"author": {"login": "reviewer"}, "authorAssociation": "OWNER", "createdAt": "2026-05-05T20:10:00Z", "body": "one more change"}]},
         ]
         result = code_factory.check_plan_feedback("owner/repo")
         self.assertEqual(
@@ -219,7 +257,7 @@ class TestCheckPlanFeedback(unittest.TestCase):
               "labels": [{"name": "bot:plan-proposed"}], "issue_number": 42}],
         )
 
-    @patch("code_factory.gh_json")
+    @patch("spine.gh_json")
     def test_human_comments_detected_when_bot_shares_user_account(self, mock_gh_json):
         # Bot runs as the human user, so author.login is identical for both.
         # The marker — not the login — is what distinguishes bot from human.
@@ -227,8 +265,8 @@ class TestCheckPlanFeedback(unittest.TestCase):
             [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix",
               "labels": [{"name": "bot:plan-proposed"}]}],
             {"comments": [
-                {"author": {"login": "shared-user"}, "createdAt": "2026-05-05T20:00:00Z", "body": "lgtm"},
-                {"author": {"login": "shared-user"}, "createdAt": "2026-05-05T20:10:00Z", "body": "actually, design question..."},
+                {"author": {"login": "shared-user"}, "authorAssociation": "OWNER", "createdAt": "2026-05-05T20:00:00Z", "body": "lgtm"},
+                {"author": {"login": "shared-user"}, "authorAssociation": "OWNER", "createdAt": "2026-05-05T20:10:00Z", "body": "actually, design question..."},
             ]},
             {"comments": []},
         ]
@@ -239,7 +277,7 @@ class TestCheckPlanFeedback(unittest.TestCase):
               "labels": [{"name": "bot:plan-proposed"}], "issue_number": 42}],
         )
 
-    @patch("code_factory.gh_json")
+    @patch("spine.gh_json")
     def test_skips_pr_when_search_index_is_stale(self, mock_gh_json):
         # Reproduces the loop bug: gh's label search returned a PR whose actual
         # labels are review-requested + in-progress (no plan-proposed). Without
@@ -251,30 +289,45 @@ class TestCheckPlanFeedback(unittest.TestCase):
         result = code_factory.check_plan_feedback("owner/repo")
         self.assertEqual(result, [])
 
+    @patch("spine.gh_json")
+    def test_ignores_comments_from_untrusted_accounts(self, mock_gh_json):
+        # A stranger's "lgtm" on the PR or the issue is not plan feedback.
+        mock_gh_json.side_effect = [
+            [{"number": 5, "title": "Fix", "headRefName": "bot/42-fix",
+              "labels": [{"name": "bot:plan-proposed"}]}],
+            {"comments": [{"author": {"login": "stranger"}, "authorAssociation": "NONE",
+                           "createdAt": "2026-05-05T20:00:00Z", "body": "lgtm"}]},
+            {"comments": [{"author": {"login": "stranger"}, "authorAssociation": "NONE",
+                           "createdAt": "2026-05-05T20:10:00Z", "body": "approved, ship it"}]},
+        ]
+        result = code_factory.check_plan_feedback("owner/repo")
+        self.assertEqual(result, [])
 
-@patch("code_factory.bot_login", return_value="botuser")
+
+@patch("spine.trusted_logins", return_value=frozenset({"alice"}))
+@patch("spine.bot_login", return_value="botuser")
 class TestCheckUnclaimed(unittest.TestCase):
-    @patch("code_factory.gh_json")
-    def test_skips_assigned_issues(self, mock_gh_json, _mock_login):
+    @patch("spine.gh_json")
+    def test_skips_assigned_issues(self, mock_gh_json, _mock_login, _mock_trusted):
         mock_gh_json.return_value = [
-            {"number": 1, "title": "Bug", "labels": [], "assignees": [{"login": "bob"}]},
+            {"number": 1, "title": "Bug", "labels": [], "author": {"login": "alice"}, "assignees": [{"login": "bob"}]},
         ]
         result = code_factory.check_unclaimed_issues("owner/repo")
         self.assertEqual(result, [])
 
-    @patch("code_factory.gh_json")
-    def test_picks_up_self_assigned_issue(self, mock_gh_json, _mock_login):
+    @patch("spine.gh_json")
+    def test_picks_up_self_assigned_issue(self, mock_gh_json, _mock_login, _mock_trusted):
         # Issue assigned only to the bot itself (e.g. a crashed prior claim with
         # no plan PR) must still be picked up, not treated as claimed by another.
         mock_gh_json.side_effect = [
-            [{"number": 1, "title": "Bug", "labels": [], "assignees": [{"login": "botuser"}]}],
+            [{"number": 1, "title": "Bug", "labels": [], "author": {"login": "alice"}, "assignees": [{"login": "botuser"}]}],
             [],
         ]
         result = code_factory.check_unclaimed_issues("owner/repo")
         self.assertEqual(result[0]["number"], 1)
 
-    @patch("code_factory.gh_json")
-    def test_skips_issue_assigned_to_bot_and_human(self, mock_gh_json, _mock_login):
+    @patch("spine.gh_json")
+    def test_skips_issue_assigned_to_bot_and_human(self, mock_gh_json, _mock_login, _mock_trusted):
         # A human assignee alongside the bot still means a human owns it.
         mock_gh_json.return_value = [
             {"number": 1, "title": "Bug", "labels": [],
@@ -283,25 +336,37 @@ class TestCheckUnclaimed(unittest.TestCase):
         result = code_factory.check_unclaimed_issues("owner/repo")
         self.assertEqual(result, [])
 
-    @patch("code_factory.gh_json")
-    def test_skips_issues_with_open_prs(self, mock_gh_json, _mock_login):
+    @patch("spine.gh_json")
+    def test_skips_issues_with_open_prs(self, mock_gh_json, _mock_login, _mock_trusted):
         mock_gh_json.side_effect = [
-            [{"number": 1, "title": "Bug", "labels": [], "assignees": []}],
+            [{"number": 1, "title": "Bug", "labels": [], "author": {"login": "alice"}, "assignees": []}],
             [{"headRefName": "bot/1-bug"}],
         ]
         result = code_factory.check_unclaimed_issues("owner/repo")
         self.assertEqual(result, [])
 
-    @patch("code_factory.gh_json")
-    def test_returns_unassigned_issue_with_no_prs(self, mock_gh_json, _mock_login):
+    @patch("spine.gh_json")
+    def test_returns_unassigned_issue_with_no_prs(self, mock_gh_json, _mock_login, _mock_trusted):
         mock_gh_json.side_effect = [
-            [{"number": 1, "title": "Bug", "labels": [], "assignees": []}],
+            [{"number": 1, "title": "Bug", "labels": [], "author": {"login": "alice"}, "assignees": []}],
             [],
         ]
         result = code_factory.check_unclaimed_issues("owner/repo")
-        self.assertEqual(result, [{"number": 1, "title": "Bug", "labels": [], "assignees": []}])
+        self.assertEqual(result, [{"number": 1, "title": "Bug", "labels": [], "author": {"login": "alice"}, "assignees": []}])
+
+    @patch("spine.gh_json")
+    def test_skips_issue_filed_by_non_collaborator(self, mock_gh_json, _mock_login, _mock_trusted):
+        mock_gh_json.side_effect = [
+            [{"number": 1, "title": "Bug", "labels": [], "author": {"login": "stranger"}, "assignees": []}],
+            [],
+        ]
+        result = code_factory.check_unclaimed_issues("owner/repo")
+        self.assertEqual(result, [])
 
 
+@patch("code_factory.janitor_clear_stale_claims")
+@patch("code_factory.open_plan_count", return_value=0)
+@patch("code_factory.get_failed_prs", return_value=set())
 class TestRoute(unittest.TestCase):
     @patch("code_factory.check_unclaimed_issues", return_value=[])
     @patch("code_factory.check_accepted_plans", return_value=[])
@@ -311,12 +376,12 @@ class TestRoute(unittest.TestCase):
     def test_returns_none_when_no_work(self, *_):
         self.assertIsNone(code_factory.route("owner/repo"))
 
-    @patch("code_factory.check_unclaimed_issues")
+    @patch("code_factory.check_unclaimed_issues", return_value=[])
     @patch("code_factory.check_accepted_plans", return_value=[])
     @patch("code_factory.check_plan_feedback", return_value=[])
     @patch("code_factory.check_review_requested", return_value=[{"number": 5, "title": "Fix"}])
     @patch("code_factory.get_in_progress_prs", return_value=set())
-    def test_priority1_takes_precedence(self, _, mock_review, *__):
+    def test_priority1_takes_precedence(self, *_):
         result = code_factory.route("owner/repo")
         self.assertEqual(result[0], "phase6_process_review")
         self.assertEqual(result[1]["pr"]["number"], 5)
@@ -331,7 +396,7 @@ class TestRoute(unittest.TestCase):
         self.assertEqual(result[0], "phase1_claim_and_plan")
         self.assertEqual(result[1]["issue"]["number"], 10)
 
-    @patch("code_factory.check_unclaimed_issues")
+    @patch("code_factory.check_unclaimed_issues", return_value=[])
     @patch("code_factory.check_accepted_plans", return_value=[])
     @patch("code_factory.check_plan_feedback", return_value=[])
     @patch("code_factory.check_review_requested", return_value=[{"number": 5, "title": "Fix"}])
@@ -339,6 +404,48 @@ class TestRoute(unittest.TestCase):
     def test_in_progress_pr_excluded(self, *_):
         result = code_factory.route("owner/repo")
         self.assertIsNone(result)
+
+    def test_janitor_runs_on_every_route(self, mock_failed, mock_count, mock_janitor):
+        with patch("code_factory.get_in_progress_prs", return_value=set()), \
+             patch("code_factory.check_review_requested", return_value=[]), \
+             patch("code_factory.check_plan_feedback", return_value=[]), \
+             patch("code_factory.check_accepted_plans", return_value=[]), \
+             patch("code_factory.check_unclaimed_issues", return_value=[]):
+            code_factory.route("owner/repo")
+        mock_janitor.assert_called_once_with("owner/repo")
+
+
+@patch("code_factory.janitor_clear_stale_claims")
+class TestRouteProtection(unittest.TestCase):
+    @patch("code_factory.check_unclaimed_issues", return_value=[])
+    @patch("code_factory.check_accepted_plans", return_value=[])
+    @patch("code_factory.check_plan_feedback", return_value=[])
+    @patch("code_factory.check_review_requested", return_value=[{"number": 5, "title": "Fix"}])
+    @patch("code_factory.get_failed_prs", return_value={5})
+    @patch("code_factory.get_in_progress_prs", return_value=set())
+    def test_bot_failed_pr_is_skipped(self, *_):
+        self.assertIsNone(code_factory.route("owner/repo"))
+
+    @patch("code_factory.open_plan_count", return_value=code_factory.WIP_LIMIT)
+    @patch("code_factory.check_unclaimed_issues", return_value=[{"number": 10, "title": "New"}])
+    @patch("code_factory.check_accepted_plans", return_value=[])
+    @patch("code_factory.check_plan_feedback", return_value=[])
+    @patch("code_factory.check_review_requested", return_value=[])
+    @patch("code_factory.get_failed_prs", return_value=set())
+    @patch("code_factory.get_in_progress_prs", return_value=set())
+    def test_wip_limit_refuses_new_plans(self, *_):
+        self.assertIsNone(code_factory.route("owner/repo"))
+
+    @patch("code_factory.open_plan_count", return_value=code_factory.WIP_LIMIT - 1)
+    @patch("code_factory.check_unclaimed_issues", return_value=[{"number": 10, "title": "New"}])
+    @patch("code_factory.check_accepted_plans", return_value=[])
+    @patch("code_factory.check_plan_feedback", return_value=[])
+    @patch("code_factory.check_review_requested", return_value=[])
+    @patch("code_factory.get_failed_prs", return_value=set())
+    @patch("code_factory.get_in_progress_prs", return_value=set())
+    def test_under_wip_limit_still_plans(self, *_):
+        result = code_factory.route("owner/repo")
+        self.assertEqual(result[0], "phase1_claim_and_plan")
 
 
 class TestParseClaudeJson(unittest.TestCase):
@@ -453,6 +560,27 @@ class TestPhase2(unittest.TestCase):
         mock_remove.assert_called_once_with("owner/repo", 5)
 
 
+class TestPhase6(unittest.TestCase):
+    @patch("code_factory.gh")
+    @patch("code_factory.llm_reason")
+    @patch("code_factory.remove_in_progress")
+    @patch("code_factory.add_in_progress")
+    @patch("code_factory.fetch_review_payload")
+    def test_no_trusted_review_never_reaches_llm_or_merge(
+        self, mock_payload, mock_add, mock_remove, mock_llm, mock_gh
+    ):
+        mock_payload.return_value = json.dumps(
+            {"reviews": {"nodes": []}, "reviewThreads": {"nodes": []}}
+        )
+        result = code_factory.phase6_process_review(
+            repo="owner/repo", pr={"number": 5, "title": "Fix"}
+        )
+        self.assertIsNone(result)
+        mock_llm.assert_not_called()
+        mock_gh.assert_not_called()
+        mock_remove.assert_called_once_with("owner/repo", 5)
+
+
 class TestAgentSelection(unittest.TestCase):
     @patch("code_factory._run_agent_command")
     def test_llm_reason_uses_claude_by_default(self, mock_run):
@@ -464,7 +592,11 @@ class TestAgentSelection(unittest.TestCase):
         finally:
             code_factory.AGENT_CLI = original
         self.assertEqual(result, "ok")
-        mock_run.assert_called_once_with(["claude", "-p", "prompt", "--print"])
+        mock_run.assert_called_once_with(
+            ["claude", "-p", "prompt", "--print", "--output-format", "stream-json", "--verbose"],
+            cwd=None,
+            log_path=None,
+        )
 
     @patch("code_factory._codex")
     def test_llm_reason_uses_codex_when_selected(self, mock_codex):
@@ -476,7 +608,7 @@ class TestAgentSelection(unittest.TestCase):
         finally:
             code_factory.AGENT_CLI = original
         self.assertEqual(result, "ok")
-        mock_codex.assert_called_once_with("prompt")
+        mock_codex.assert_called_once_with("prompt", workdir=None, log_name=None)
 
     @patch("code_factory._run_agent_command")
     def test_llm_interactive_uses_claude(self, mock_run):
@@ -489,8 +621,12 @@ class TestAgentSelection(unittest.TestCase):
             code_factory.AGENT_CLI = original
         self.assertEqual(result, "ok")
         mock_run.assert_called_once_with(
-            ["claude", "--dangerously-skip-permissions", "-p", "prompt", "--print"],
+            [
+                "claude", "--dangerously-skip-permissions", "-p", "prompt", "--print",
+                "--output-format", "stream-json", "--verbose",
+            ],
             cwd="/tmp/repo",
+            log_path=None,
         )
 
     @patch("code_factory._codex")
@@ -503,55 +639,133 @@ class TestAgentSelection(unittest.TestCase):
         finally:
             code_factory.AGENT_CLI = original
         self.assertEqual(result, "ok")
-        mock_codex.assert_called_once_with("prompt", workdir="/tmp/repo", interactive=True)
+        mock_codex.assert_called_once_with(
+            "prompt", workdir="/tmp/repo", interactive=True, log_name=None
+        )
 
 
 class TestMain(unittest.TestCase):
+    @patch("code_factory.load_env")
     @patch("code_factory.bootstrap_repo")
     @patch("code_factory.time.sleep")
     @patch("code_factory.route", return_value=None)
     @patch("code_factory.get_repo", return_value="owner/repo")
-    def test_once_mode_exits_when_no_work(self, mock_repo, mock_route, mock_sleep, mock_bootstrap):
-        with patch("sys.argv", ["code_factory.py", "--once"]):
-            code_factory.main()
+    def test_once_mode_exits_when_no_work(self, mock_repo, mock_route, mock_sleep, mock_bootstrap, _env):
+        with patch("sys.argv", ["code_factory.py", "--loop", "--once"]):
+            with self.assertRaises(SystemExit) as ctx:
+                code_factory.main()
+        self.assertEqual(ctx.exception.code, 0)
         mock_route.assert_called_once_with("owner/repo")
         mock_sleep.assert_not_called()
 
+    @patch("code_factory.load_env")
     @patch("code_factory.bootstrap_repo")
     @patch("code_factory.route", return_value=None)
     @patch("code_factory.get_repo", return_value="owner/repo")
-    def test_agent_positional_argument_selects_codex(self, mock_repo, mock_route, mock_bootstrap):
+    def test_agent_flag_selects_codex(self, mock_repo, mock_route, mock_bootstrap, _env):
         original = code_factory.AGENT_CLI
         try:
-            with patch("sys.argv", ["code_factory.py", "codex", "--once"]):
-                code_factory.main()
+            with patch("sys.argv", ["code_factory.py", "--agent", "codex", "--loop", "--once"]):
+                with self.assertRaises(SystemExit):
+                    code_factory.main()
             self.assertEqual(code_factory.AGENT_CLI, "codex")
         finally:
             code_factory.AGENT_CLI = original
 
+    @patch("code_factory.load_env")
     @patch("code_factory.bootstrap_repo")
     @patch("code_factory.time.sleep")
     @patch("code_factory.remove_in_progress")
     @patch("code_factory.route")
     @patch("code_factory.get_repo", return_value="owner/repo")
-    def test_once_mode_runs_phase_and_exits(self, mock_repo, mock_route, mock_remove, mock_sleep, mock_bootstrap):
+    def test_once_mode_runs_phase_and_exits(self, mock_repo, mock_route, mock_remove, mock_sleep, mock_bootstrap, _env):
         phase_fn = MagicMock(return_value=None)
         mock_route.return_value = ("test_phase", {"repo": "owner/repo", "pr": {"number": 1}})
         with patch("sys.argv", ["code_factory.py", "--once"]):
             with patch.dict(code_factory.PHASES, {"test_phase": phase_fn}):
-                code_factory.main()
+                with self.assertRaises(SystemExit):
+                    code_factory.main()
         phase_fn.assert_called_once()
 
+    @patch("code_factory.load_env")
     @patch("code_factory.bootstrap_repo")
     @patch("code_factory.time.sleep")
     @patch("code_factory.remove_in_progress")
     @patch("code_factory.route")
     @patch("code_factory.get_repo", return_value="owner/repo")
-    def test_error_cleans_up_in_progress(self, mock_repo, mock_route, mock_remove, mock_sleep, mock_bootstrap):
+    def test_error_cleans_up_in_progress(self, mock_repo, mock_route, mock_remove, mock_sleep, mock_bootstrap, _env):
         def failing_phase(**ctx):
             raise RuntimeError("boom")
         mock_route.return_value = ("test_phase", {"repo": "owner/repo", "pr": {"number": 7}})
         with patch("sys.argv", ["code_factory.py", "--once"]):
             with patch.dict(code_factory.PHASES, {"test_phase": failing_phase}):
-                code_factory.main()
+                with self.assertRaises(SystemExit):
+                    code_factory.main()
         mock_remove.assert_called_once_with("owner/repo", 7)
+
+
+class TestRunSubcommand(unittest.TestCase):
+    def _args(self, argv):
+        return code_factory.build_parser().parse_args(argv)
+
+    @patch("code_factory.gh_json")
+    @patch("code_factory.bootstrap_repo")
+    @patch("code_factory.get_repo", return_value="owner/repo")
+    def test_run_pr_phase_executes_chain_and_returns_zero(self, mock_repo, mock_bootstrap, mock_gh_json):
+        mock_gh_json.return_value = {"number": 5, "title": "Fix", "headRefName": "bot/2-fix"}
+        phase_fn = MagicMock(return_value=None)
+        with patch.dict(code_factory.PHASES, {"phase4_implement": phase_fn}):
+            rc = code_factory.cmd_run(self._args(["run", "--pr", "5", "--phase", "4"]))
+        self.assertEqual(rc, 0)
+        phase_fn.assert_called_once_with(
+            repo="owner/repo", pr={"number": 5, "title": "Fix", "headRefName": "bot/2-fix"}
+        )
+        mock_bootstrap.assert_called_once_with("owner/repo", sync=False)
+
+    @patch("code_factory.gh_json")
+    @patch("code_factory.bootstrap_repo")
+    @patch("code_factory.get_repo", return_value="owner/repo")
+    def test_run_pr_failure_returns_nonzero(self, mock_repo, mock_bootstrap, mock_gh_json):
+        mock_gh_json.return_value = {"number": 5, "title": "Fix", "headRefName": "bot/2-fix"}
+        def failing_phase(**ctx):
+            raise RuntimeError("boom")
+        with patch("code_factory.remove_in_progress"):
+            with patch.dict(code_factory.PHASES, {"phase6_process_review": failing_phase}):
+                rc = code_factory.cmd_run(self._args(["run", "--pr", "5", "--phase", "phase6"]))
+        self.assertEqual(rc, 1)
+
+    @patch("code_factory.gh_json")
+    @patch("code_factory.bootstrap_repo")
+    @patch("code_factory.get_repo", return_value="owner/repo")
+    def test_run_issue_executes_phase1(self, mock_repo, mock_bootstrap, mock_gh_json):
+        mock_gh_json.return_value = {"number": 12, "title": "New feature"}
+        phase_fn = MagicMock(return_value=None)
+        with patch.dict(code_factory.PHASES, {"phase1_claim_and_plan": phase_fn}):
+            rc = code_factory.cmd_run(self._args(["run", "--issue", "12"]))
+        self.assertEqual(rc, 0)
+        phase_fn.assert_called_once_with(repo="owner/repo", issue={"number": 12, "title": "New feature"})
+
+    @patch("code_factory.bootstrap_repo")
+    @patch("code_factory.get_repo", return_value="owner/repo")
+    def test_run_pr_without_phase_is_an_error(self, mock_repo, mock_bootstrap):
+        rc = code_factory.cmd_run(self._args(["run", "--pr", "5"]))
+        self.assertEqual(rc, 2)
+
+    @patch("code_factory.bootstrap_repo")
+    @patch("code_factory.get_repo", return_value="owner/repo")
+    def test_run_pr_with_unknown_phase_is_an_error(self, mock_repo, mock_bootstrap):
+        rc = code_factory.cmd_run(self._args(["run", "--pr", "5", "--phase", "nonsense"]))
+        self.assertEqual(rc, 2)
+
+    def test_run_requires_exactly_one_of_pr_or_issue(self):
+        with self.assertRaises(SystemExit):
+            self._args(["run"])
+        with self.assertRaises(SystemExit):
+            self._args(["run", "--pr", "5", "--issue", "3"])
+
+    def test_phase_aliases_resolve(self):
+        self.assertEqual(code_factory.RUN_PHASE_ALIASES["4"], "phase4_implement")
+        self.assertEqual(code_factory.RUN_PHASE_ALIASES["phase6"], "phase6_process_review")
+        self.assertEqual(
+            code_factory.RUN_PHASE_ALIASES["phase2_process_feedback"], "phase2_process_feedback"
+        )

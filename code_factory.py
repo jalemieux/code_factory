@@ -7,23 +7,66 @@ import argparse
 import json
 import os
 import re
-import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-from datetime import datetime
-from functools import lru_cache
+from datetime import datetime, timezone
 from pathlib import Path
+
+# GitHub state-machine primitives live in spine (see agentic-stack-v2.md);
+# this file keeps the phase logic and drives them.
+from spine import (
+    PHASE2_MARKER,
+    TRUSTED_COMMENTS_JQ,
+    WIP_LIMIT,
+    _fmt_argv,
+    _issue_num_from_branch,
+    add_in_progress,
+    add_label,
+    bot_login,
+    check_accepted_plans,
+    check_plan_feedback,
+    check_review_requested,
+    check_unclaimed_issues,
+    ensure_labels,
+    get_failed_prs,
+    get_in_progress_prs,
+    get_repo,
+    gh,
+    gh_json,
+    is_trusted_reviewer,
+    log,
+    open_plan_count,
+    remove_in_progress,
+    slugify,
+    swap_label,
+)
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 ENV_FILE = Path(__file__).parent / ".env"
+LOGS_DIR = Path(__file__).parent / "logs"  # gitignored; streamed agent output + failure state
 AGENT_CLI = "claude"
-PHASE2_MARKER = "<!-- code-factory:phase2-processed -->"
+
+# Wall-clock limit for a single agent invocation (task 2.4). Overridable
+# with --timeout-minutes; a timeout is treated as a phase failure.
+PHASE_TIMEOUT_SECONDS: float = 30 * 60
+
+# Consecutive failures on the same PR before it's parked as bot:failed.
+FAILURE_THRESHOLD = 2
+
+# Claims (bot:in-progress) older than this are cleared by the janitor.
+IN_PROGRESS_MAX_AGE_HOURS = 2.0
+
+# Absolute path of the main clone, set by bootstrap_repo(). Phase code asks
+# for it via _repo_root() and passes it (or a worktree path) explicitly to
+# every git() call — nothing below bootstrap relies on the process cwd.
+REPO_ROOT: str | None = None
 
 
-def log(msg: str) -> None:
-    print(f"{datetime.now():%Y-%m-%d %H:%M:%S} — {msg}", file=sys.stderr)
+def _repo_root() -> str:
+    return REPO_ROOT or os.getcwd()
 
 
 def load_env(path: Path = ENV_FILE) -> None:
@@ -62,55 +105,6 @@ def load_env(path: Path = ENV_FILE) -> None:
             os.environ[dst] = os.environ[src]
 
 
-def _fmt_argv(prog: str, args: tuple[str, ...]) -> str:
-    parts = [prog]
-    for a in args:
-        if "\n" in a or len(a) > 120:
-            parts.append(f"<{len(a)}-char arg>")
-        else:
-            parts.append(shlex.quote(a))
-    return " ".join(parts)
-
-
-def gh(*args: str) -> str:
-    """Run a gh CLI command and return stdout, retrying on rate limits and transient server errors."""
-    for attempt in range(4):
-        result = subprocess.run(
-            ["gh", *args], capture_output=True, text=True
-        )
-        if result.returncode == 0:
-            return result.stdout.strip()
-        stderr_lower = result.stderr.lower()
-        transient = (
-            "rate limit" in stderr_lower
-            or re.search(r"http 5\d\d", stderr_lower)
-            or "gateway timeout" in stderr_lower
-            or "timeout" in stderr_lower
-            or "temporarily unavailable" in stderr_lower
-            or "connection reset" in stderr_lower
-        )
-        if transient and attempt < 3:
-            wait = 2 ** attempt * 15
-            log(f"Transient gh error, retrying in {wait}s: {result.stderr.strip()[:120]}")
-            time.sleep(wait)
-            continue
-        detail = result.stderr.strip() or result.stdout.strip() or "<no output>"
-        raise RuntimeError(
-            f"{_fmt_argv('gh', args)} (exit {result.returncode}): {detail}"
-        )
-    return ""
-
-
-def gh_json(*args: str) -> list | dict:
-    return json.loads(gh(*args) or "[]")
-
-
-@lru_cache(maxsize=1)
-def bot_login() -> str:
-    """The gh login this bot authenticates as. Cached — it can't change mid-run."""
-    return gh("api", "user", "-q", ".login")
-
-
 def fetch_review_payload(repo: str, num: int) -> str:
     """Return reviews + per-line review thread comments as pretty JSON.
 
@@ -119,6 +113,10 @@ def fetch_review_payload(repo: str, num: int) -> str:
     a `gh pr view` field at all (it's a GraphQL field on `pullRequest`).
     We need both — the prompt asks the LLM to reason about inline comments
     and unresolved threads, so we fetch them via GraphQL in one call.
+
+    Reviews and thread comments from untrusted accounts are dropped before
+    the payload reaches the LLM: on a public repo anyone can approve or
+    comment, and phase 6 merges on "approved".
     """
     owner, name = repo.split("/", 1)
     query = (
@@ -126,13 +124,13 @@ def fetch_review_payload(repo: str, num: int) -> str:
         "  repository(owner: $owner, name: $name) {"
         "    pullRequest(number: $num) {"
         "      reviews(first: 50) {"
-        "        nodes { author { login } state submittedAt body }"
+        "        nodes { author { login } authorAssociation state submittedAt body }"
         "      }"
         "      reviewThreads(first: 100) {"
         "        nodes {"
         "          isResolved isOutdated"
         "          comments(first: 50) {"
-        "            nodes { author { login } body path line originalLine diffHunk createdAt }"
+        "            nodes { author { login } authorAssociation body path line originalLine diffHunk createdAt }"
         "          }"
         "        }"
         "      }"
@@ -148,11 +146,42 @@ def fetch_review_payload(repo: str, num: int) -> str:
         "-F", f"num={num}",
     )
     pr_data = json.loads(raw).get("data", {}).get("repository", {}).get("pullRequest", {})
-    return json.dumps(pr_data, indent=2)
+    return json.dumps(_trusted_review_data(pr_data), indent=2)
 
 
-def git(*args: str) -> str:
-    """Run a git command, raise on failure."""
+def _trusted_review_data(pr_data: dict) -> dict:
+    """Drop reviews and thread comments whose author isn't trusted."""
+    def trusted(nodes: list[dict]) -> list[dict]:
+        return [n for n in nodes if is_trusted_reviewer(n.get("authorAssociation"))]
+
+    if "reviews" in pr_data:
+        pr_data["reviews"]["nodes"] = trusted(pr_data["reviews"].get("nodes", []))
+    if "reviewThreads" in pr_data:
+        threads = []
+        for thread in pr_data["reviewThreads"].get("nodes", []):
+            comments = trusted(thread.get("comments", {}).get("nodes", []))
+            if comments:
+                thread["comments"]["nodes"] = comments
+                threads.append(thread)
+        pr_data["reviewThreads"]["nodes"] = threads
+    return pr_data
+
+
+def _has_review_feedback(reviews_json: str) -> bool:
+    data = json.loads(reviews_json)
+    return bool(
+        data.get("reviews", {}).get("nodes")
+        or data.get("reviewThreads", {}).get("nodes")
+    )
+
+
+def git(*args: str, cwd: str | None = None) -> str:
+    """Run a git command, raise on failure.
+
+    `cwd=None` keeps legacy behavior (the process working directory); phase
+    code always passes an explicit cwd so work can happen in worktrees
+    without `os.chdir` games.
+    """
     cmd = ["git"]
     if os.environ.get("GH_TOKEN"):
         # Force github.com pushes/fetches to authenticate with the token from
@@ -163,7 +192,7 @@ def git(*args: str) -> str:
             "-c", "credential.https://github.com.helper=!gh auth git-credential",
         ])
     cmd.extend(args)
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or "<no output>"
         raise RuntimeError(
@@ -172,8 +201,142 @@ def git(*args: str) -> str:
     return result.stdout.strip()
 
 
-def slugify(title: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", title.lower())[:40].strip("-")
+def git_retry(*args: str, cwd: str | None = None, attempts: int = 3, delay: float = 0.3) -> str:
+    """git() with a short retry for shared-state lock contention.
+
+    Sibling worktrees share one `.git` — concurrent commands that write
+    shared files (`config`, worktree bookkeeping, packed-refs) can collide
+    on a `.lock` (observed in spike 0.1 on concurrent `push -u`). Three
+    attempts with a short sleep is enough; anything else re-raises.
+    """
+    last_error: RuntimeError | None = None
+    for attempt in range(attempts):
+        try:
+            return git(*args, cwd=cwd)
+        except RuntimeError as e:
+            message = str(e).lower()
+            retryable = "could not lock" in message or "unable to lock" in message or ".lock" in message
+            if not retryable or attempt == attempts - 1:
+                raise
+            last_error = e
+            log(f"git lock contention, retrying in {delay}s: {e}")
+            time.sleep(delay)
+    raise last_error  # unreachable, but keeps the type checker honest
+
+
+class WorktreeCleanupRefused(RuntimeError):
+    """Worktree cleanup declined to destroy state (dirty tree or unpushed work).
+
+    Everything is left in place; the caller decides what to do (phases mark
+    the PR `bot:failed` with an explanatory comment).
+    """
+
+
+class Worktree:
+    """A git worktree for exactly one unit of work.
+
+    Enter: `git worktree prune` (clears stale entries from crashed workers),
+    then `git worktree add` under `<repo_root>/.worktrees/` on <branch>,
+    creating the branch from `origin/<branch>` (or HEAD) if needed. Pass
+    `base` to cut a new branch from that ref instead — HEAD is whatever the
+    main clone happens to have checked out, which is no basis for new work.
+
+    Exit: hard-gated cleanup per spike 0.1 (dev_stack notes/spike-01):
+    `worktree remove` alone is recoverable (the branch ref survives in the
+    shared clone) — the destroyer is the follow-up `git branch -D`. So:
+
+      - dirty tree        → refuse removal; NEVER pass `--force`.
+      - unpushed commits  → refuse `branch -D`. Measured by
+        `rev-list --count @{upstream}..HEAD`, falling back to
+        `origin/<branch>..HEAD`; "no upstream and no remote ref" is
+        treated as unpushed.
+
+    On refusal everything stays in place and WorktreeCleanupRefused is
+    raised. If the body itself raised, no cleanup is attempted (the
+    worktree is left for inspection) and the original exception propagates.
+    """
+
+    def __init__(self, repo_root: str, branch: str, base: str | None = None):
+        self.repo_root = os.path.abspath(repo_root)
+        self.branch = branch
+        self.base = base
+        self.path = os.path.join(self.repo_root, ".worktrees", branch.replace("/", "-"))
+
+    def _ref_exists(self, ref: str) -> bool:
+        try:
+            git("rev-parse", "--verify", "--quiet", ref, cwd=self.repo_root)
+            return True
+        except RuntimeError:
+            return False
+
+    def __enter__(self) -> "Worktree":
+        git_retry("worktree", "prune", cwd=self.repo_root)
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        if self._ref_exists(f"refs/heads/{self.branch}"):
+            git_retry("worktree", "add", self.path, self.branch, cwd=self.repo_root)
+        elif self.base:
+            git_retry(
+                # --no-track: starting from a remote ref would otherwise
+                # make it the upstream, so the cleanup gate would measure
+                # against the base instead of the pushed branch.
+                "worktree", "add", "--no-track", "-b", self.branch, self.path,
+                self.base, cwd=self.repo_root,
+            )
+        elif self._ref_exists(f"refs/remotes/origin/{self.branch}"):
+            git_retry(
+                "worktree", "add", "-b", self.branch, self.path,
+                f"origin/{self.branch}", cwd=self.repo_root,
+            )
+        else:
+            git_retry("worktree", "add", "-b", self.branch, self.path, cwd=self.repo_root)
+        return self
+
+    def is_dirty(self) -> bool:
+        return bool(git("status", "--porcelain", cwd=self.path))
+
+    def unpushed_count(self) -> int | None:
+        """Commits on HEAD that the remote doesn't have; None = no remote ref at all."""
+        try:
+            return int(git("rev-list", "--count", "@{upstream}..HEAD", cwd=self.path))
+        except RuntimeError:
+            pass
+        # Workers push with an explicit refspec (no -u), so there's usually no
+        # upstream — but the push still updates refs/remotes/origin/<branch>.
+        try:
+            return int(git("rev-list", "--count", f"origin/{self.branch}..HEAD", cwd=self.path))
+        except RuntimeError:
+            return None
+
+    def cleanup(self) -> None:
+        """Remove the worktree and delete the local branch — gated. May refuse."""
+        if self.is_dirty():
+            raise WorktreeCleanupRefused(
+                f"worktree {self.path} has uncommitted changes; "
+                "refusing removal (and never passing --force)"
+            )
+        unpushed = self.unpushed_count()
+        if unpushed is None or unpushed > 0:
+            reason = (
+                "no upstream/remote ref (treated as unpushed)"
+                if unpushed is None
+                else f"{unpushed} unpushed commit(s)"
+            )
+            raise WorktreeCleanupRefused(
+                f"branch {self.branch} has {reason}; refusing `git branch -D` "
+                f"(worktree left at {self.path})"
+            )
+        git_retry("worktree", "remove", self.path, cwd=self.repo_root)
+        git_retry("branch", "-D", self.branch, cwd=self.repo_root)
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if exc_type is not None:
+            log(
+                f"Worktree {self.path}: leaving worktree and branch in place "
+                f"after {exc_type.__name__}"
+            )
+            return False
+        self.cleanup()
+        return False
 
 
 def _strip_outer_fence(text: str) -> str:
@@ -191,75 +354,11 @@ def _strip_outer_fence(text: str) -> str:
     return inner
 
 
-def _issue_num_from_branch(branch: str) -> int | None:
-    """Branches created by phase1 are `bot/<num>-<slug>` — extract <num>."""
-    m = re.match(r"^bot/(\d+)-", branch or "")
-    return int(m.group(1)) if m else None
-
-
-def ensure_labels(repo: str) -> None:
-    for label in (
-        "bot:plan-proposed",
-        "bot:plan-accepted",
-        "bot:in-progress",
-        "bot:review-requested",
-    ):
-        gh(
-            "label", "create", label,
-            "--repo", repo,
-            "--description", "Managed by git-contribute",
-            "--color", "0E8A16",
-            "--force",
-        )
-
-
-def add_label(repo: str, num: int, label: str) -> None:
-    gh("api", f"repos/{repo}/issues/{num}/labels", "-f", f"labels[]={label}")
-
-
-def remove_label(repo: str, num: int, label: str) -> None:
-    try:
-        gh("api", f"repos/{repo}/issues/{num}/labels/{label}", "-X", "DELETE")
-    except RuntimeError:
-        pass
-
-
-def add_in_progress(repo: str, num: int) -> None:
-    add_label(repo, num, "bot:in-progress")
-
-
-def remove_in_progress(repo: str, num: int) -> None:
-    remove_label(repo, num, "bot:in-progress")
-
-
-def swap_label(repo: str, num: int, old: str, new: str) -> None:
-    remove_label(repo, num, old)
-    add_label(repo, num, new)
-
-
-def get_repo(repo: str | None = None) -> str:
-    if repo:
-        return repo
-    return gh("repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner")
-
-
-def _has_label(pr: dict, name: str) -> bool:
-    """Authoritative check for label presence.
-
-    `gh pr list --label X` queries the search index, which is eventually
-    consistent — when labels flip rapidly it returns PRs whose actual
-    labels no longer include X. The labels embedded in `--json labels`
-    come from the PR detail API and reflect current state, so we
-    re-verify before trusting a search hit.
-    """
-    return any(l.get("name") == name for l in pr.get("labels", []))
-
-
-def read_repo_conventions(repo: str) -> str:
+def read_repo_conventions(repo: str, cwd: str | None = None) -> str:
     conventions = []
     for fname in ("CONTRIBUTING.md", "CLAUDE.md", "AGENTS.md", "CODING_GUIDELINES.md"):
         try:
-            content = git("show", f"HEAD:{fname}")
+            content = git("show", f"HEAD:{fname}", cwd=cwd or _repo_root())
             conventions.append(f"## {fname}\n{content}")
         except RuntimeError:
             pass
@@ -272,22 +371,107 @@ def load_prompt(phase: str, **kwargs: str) -> str:
     return template.format(**kwargs)
 
 
-def _run_agent_command(command: list[str], *, cwd: str | None = None) -> str:
-    result = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        cwd=cwd,
-    )
-    if result.returncode != 0:
-        stderr = result.stderr.strip()
-        stdout = result.stdout.strip()
-        detail = stderr or stdout or "(no output)"
-        raise RuntimeError(f"{command[0]} failed (exit {result.returncode}): {detail}")
-    return result.stdout.strip()
+def _log_path(log_name: str | None) -> str | None:
+    """logs/<unit>-<phase>.log for a unit like 'pr-42' + phase name."""
+    if not log_name:
+        return None
+    return str(LOGS_DIR / f"{log_name}.log")
 
 
-def _codex(prompt: str, *, workdir: str | None = None, interactive: bool = False) -> str:
+def _run_agent_command(
+    command: list[str],
+    *,
+    cwd: str | None = None,
+    timeout: float | None = None,
+    log_path: str | None = None,
+) -> str:
+    """Run an agent CLI: stream stdout/stderr to `log_path` live (tail -f
+    friendly), enforce a wall-clock timeout, and return captured stdout.
+
+    A timeout kills the process and raises — callers treat it as a phase
+    failure like any other.
+    """
+    if timeout is None:
+        timeout = PHASE_TIMEOUT_SECONDS
+    log_fh = None
+    if log_path:
+        Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+        log_fh = open(log_path, "a", encoding="utf-8", errors="replace")
+        log_fh.write(f"\n=== {datetime.now():%Y-%m-%d %H:%M:%S} {_fmt_argv(command[0], tuple(command[1:]))}\n")
+        log_fh.flush()
+    lock = threading.Lock()
+
+    def _pump(stream, sink: list[str]) -> None:
+        for line in stream:
+            sink.append(line)
+            if log_fh:
+                with lock:
+                    log_fh.write(line)
+                    log_fh.flush()
+        stream.close()
+
+    out: list[str] = []
+    err: list[str] = []
+    try:
+        proc = subprocess.Popen(
+            command, cwd=cwd, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        pumps = [
+            threading.Thread(target=_pump, args=(proc.stdout, out), daemon=True),
+            threading.Thread(target=_pump, args=(proc.stderr, err), daemon=True),
+        ]
+        for t in pumps:
+            t.start()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            raise RuntimeError(
+                f"{command[0]} timed out after {timeout:.0f}s (wall clock) — phase failed"
+            )
+        for t in pumps:
+            t.join(timeout=10)
+    finally:
+        if log_fh:
+            log_fh.close()
+    if proc.returncode != 0:
+        detail = "".join(err).strip() or "".join(out).strip() or "(no output)"
+        raise RuntimeError(f"{command[0]} failed (exit {proc.returncode}): {detail}")
+    return "".join(out).strip()
+
+
+def _claude_result_from_stream(raw: str) -> str:
+    """Extract the final result from `--output-format stream-json` output.
+
+    The stream is one JSON event per line; the terminal event has
+    type "result". Falls back to the raw text if no result event is found
+    (e.g. an older CLI without stream-json).
+    """
+    for line in reversed(raw.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(event, dict) and event.get("type") == "result":
+            if event.get("is_error"):
+                detail = event.get("result") or event.get("error") or line[:400]
+                raise RuntimeError(f"claude reported an error result: {detail}")
+            return (event.get("result") or "").strip()
+    return raw.strip()
+
+
+def _codex(
+    prompt: str,
+    *,
+    workdir: str | None = None,
+    interactive: bool = False,
+    log_name: str | None = None,
+) -> str:
     with tempfile.NamedTemporaryFile(mode="r+", encoding="utf-8") as tmp:
         command = ["codex", "exec", "-o", tmp.name]
         if interactive:
@@ -297,205 +481,166 @@ def _codex(prompt: str, *, workdir: str | None = None, interactive: bool = False
         if workdir:
             command.extend(["-C", workdir])
         command.append(prompt)
-        _run_agent_command(command, cwd=workdir)
+        # Result comes from the -o tmpfile; stdout is still teed to the log.
+        _run_agent_command(command, cwd=workdir, log_path=_log_path(log_name))
         tmp.seek(0)
         return tmp.read().strip()
 
 
-def llm_reason(prompt: str) -> str:
+def llm_reason(prompt: str, log_name: str | None = None, workdir: str | None = None) -> str:
     """Run the configured agent CLI for reasoning tasks."""
     if AGENT_CLI == "codex":
-        return _codex(prompt)
-    return _run_agent_command(["claude", "-p", prompt, "--print"])
+        return _codex(prompt, workdir=workdir, log_name=log_name)
+    raw = _run_agent_command(
+        ["claude", "-p", prompt, "--print", "--output-format", "stream-json", "--verbose"],
+        cwd=workdir,
+        log_path=_log_path(log_name),
+    )
+    return _claude_result_from_stream(raw)
 
 
-def llm_interactive(prompt: str, workdir: str) -> str:
+def llm_interactive(prompt: str, workdir: str, log_name: str | None = None) -> str:
     """Run the configured agent CLI with tool access for implementation work."""
     if AGENT_CLI == "codex":
-        return _codex(prompt, workdir=workdir, interactive=True)
-    return _run_agent_command(
-        ["claude", "--dangerously-skip-permissions", "-p", prompt, "--print"],
+        return _codex(prompt, workdir=workdir, interactive=True, log_name=log_name)
+    raw = _run_agent_command(
+        [
+            "claude", "--dangerously-skip-permissions", "-p", prompt, "--print",
+            "--output-format", "stream-json", "--verbose",
+        ],
         cwd=workdir,
+        log_path=_log_path(log_name),
     )
+    return _claude_result_from_stream(raw)
 
 
-def get_in_progress_prs(repo: str) -> set[int]:
-    prs = gh_json(
-        "pr", "list", "--repo", repo,
-        "--label", "bot:in-progress",
-        "--json", "number,labels",
-    )
-    return {pr["number"] for pr in prs if _has_label(pr, "bot:in-progress")}
+# --- Failure protection (task 2.4) ---
+# Consecutive-failure counts live in logs/failure_counts.json so they
+# survive across `run` invocations (each unit is its own process). Keyed
+# "repo#pr"; a successful chain clears the entry.
+
+FAILURE_STATE_PATH = LOGS_DIR / "failure_counts.json"
 
 
-def check_review_requested(repo: str) -> list[dict]:
-    """Priority 1: PRs with code review feedback.
+def _load_failure_counts() -> dict[str, int]:
+    try:
+        return json.loads(FAILURE_STATE_PATH.read_text())
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
 
-    Authorship is intentionally not filtered — a `bot:*` label is the opt-in
-    signal that the bot should act on a PR, regardless of who opened it. This
-    lets a human author a plan PR by hand and hand it off by labeling.
+
+def _save_failure_counts(counts: dict[str, int]) -> None:
+    FAILURE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    FAILURE_STATE_PATH.write_text(json.dumps(counts, indent=2))
+
+
+def record_failure(repo: str, num: int) -> int:
+    """Increment and return the consecutive-failure count for a PR."""
+    counts = _load_failure_counts()
+    key = f"{repo}#{num}"
+    counts[key] = counts.get(key, 0) + 1
+    _save_failure_counts(counts)
+    return counts[key]
+
+
+def clear_failures(repo: str, num: int) -> None:
+    counts = _load_failure_counts()
+    if counts.pop(f"{repo}#{num}", None) is not None:
+        _save_failure_counts(counts)
+
+
+def _log_tail(log_path: str | None, lines: int = 30) -> str:
+    if not log_path or not os.path.exists(log_path):
+        return "(no log captured)"
+    try:
+        content = Path(log_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "(log unreadable)"
+    return "\n".join(content.splitlines()[-lines:]) or "(log empty)"
+
+
+def mark_failed(repo: str, num: int, reason: str, log_path: str | None = None) -> None:
+    """Park a PR as bot:failed with an explanatory comment + log tail.
+
+    Routing skips bot:failed PRs; a human removes the label to retry.
     """
-    prs = gh_json(
-        "pr", "list", "--repo", repo,
-        "--label", "bot:review-requested",
-        "--json", "number,title,updatedAt,labels",
+    add_label(repo, num, "bot:failed")
+    body = (
+        f"**Code Factory marked this PR `bot:failed`**\n\n{reason}\n\n"
+        f"Log tail:\n```\n{_log_tail(log_path)}\n```\n"
+        "Remove the `bot:failed` label to let the bot retry."
     )
-    actionable = []
-    for pr in prs:
-        if not _has_label(pr, "bot:review-requested"):
-            continue
-        info = gh_json(
-            "pr", "view", str(pr["number"]), "--repo", repo,
-            "--json", "reviews,commits",
+    gh("pr", "comment", str(num), "--repo", repo, "--body", body)
+    log(f"PR #{num} marked bot:failed: {reason}")
+
+
+# --- Janitor ---
+
+def _in_progress_labeled_at(repo: str, num: int) -> datetime | None:
+    """When `bot:in-progress` was last applied to this PR.
+
+    Mechanism (documented choice): the GitHub issue-events API's `labeled`
+    event `created_at` — one cheap extra call per in-progress PR (there are
+    at most a handful at a time), and it's authoritative, unlike scanning
+    for a claim comment.
+    """
+    try:
+        raw = gh(
+            "api", f"repos/{repo}/issues/{num}/events", "--paginate",
             "--jq",
-            "{last_review: .reviews[-1].submittedAt, last_commit: .commits[-1].committedDate}",
+            '.[] | select(.event == "labeled" and .label.name == "bot:in-progress") | .created_at',
         )
-        last_review = info.get("last_review")
-        last_commit = info.get("last_commit")
-        if last_review and last_commit and last_review > last_commit:
-            actionable.append(pr)
-    return actionable
-
-
-def check_plan_feedback(repo: str) -> list[dict]:
-    """Priority 2: Plan PRs with feedback (on the PR or the linked issue).
-
-    The `bot:plan-proposed` label is the source of truth — we don't also gate
-    on `--draft`, because a prior partial run or a manual "ready for review"
-    click can flip draft state without changing the label, which would
-    otherwise strand the PR with unprocessed feedback.
-
-    Bot vs. human comments are distinguished by the PHASE2_MARKER, not by
-    `author.login` — when the bot runs as the human user (same gh account),
-    every comment shares the same login, so the marker is the only reliable
-    signal that a comment came from the bot.
-    """
-    prs = gh_json(
-        "pr", "list", "--repo", repo,
-        "--label", "bot:plan-proposed",
-        "--json", "number,title,headRefName,labels",
-    )
-    actionable = []
-    for pr in prs:
-        if not _has_label(pr, "bot:plan-proposed"):
-            continue
-        # `gh ... --json comments` returns {"comments": [...]} — unwrap to the list.
-        pr_payload = gh_json(
-            "pr", "view", str(pr["number"]), "--repo", repo,
-            "--json", "comments",
+    except RuntimeError:
+        return None
+    stamps = [line for line in raw.splitlines() if line.strip()]
+    if not stamps:
+        return None
+    try:
+        return datetime.strptime(stamps[-1].strip(), "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
         )
-        pr_comments = pr_payload.get("comments", []) if isinstance(pr_payload, dict) else []
-
-        issue_num = _issue_num_from_branch(pr.get("headRefName", ""))
-        issue_comments = []
-        if issue_num:
-            try:
-                issue_payload = gh_json(
-                    "issue", "view", str(issue_num), "--repo", repo,
-                    "--json", "comments",
-                )
-                issue_comments = issue_payload.get("comments", []) if isinstance(issue_payload, dict) else []
-            except RuntimeError:
-                issue_comments = []
-
-        latest_human = None
-        latest_marker = None
-        for comment in [*pr_comments, *issue_comments]:
-            created_at = comment.get("createdAt")
-            body = comment.get("body") or ""
-            if not created_at:
-                continue
-            if PHASE2_MARKER in body:
-                if latest_marker is None or created_at > latest_marker:
-                    latest_marker = created_at
-                continue
-            if latest_human is None or created_at > latest_human:
-                latest_human = created_at
-
-        if latest_human and (latest_marker is None or latest_human > latest_marker):
-            pr["issue_number"] = issue_num
-            actionable.append(pr)
-    return actionable
+    except ValueError:
+        return None
 
 
-def check_accepted_plans(repo: str) -> list[dict]:
-    """Priority 3: Accepted plans ready for implementation."""
-    prs = gh_json(
-        "pr", "list", "--repo", repo,
-        "--label", "bot:plan-accepted",
-        "--json", "number,title,labels",
-    )
-    return [pr for pr in prs if _has_label(pr, "bot:plan-accepted")]
-
-
-def check_unclaimed_issues(repo: str) -> list[dict]:
-    """Priority 4: Open issues claimable by this bot with no existing plan PR.
-
-    "Linked" = there's an open PR on a branch named `bot/<N>-*`. We don't use
-    `--search "#N"` because GitHub does a fuzzy substring match across all PR
-    text, so an unrelated PR mentioning "#65" anywhere in its body would mask a
-    genuinely unclaimed issue.
-
-    A self-assignment is not a blocker: phase 1 self-assigns the issue before
-    opening the plan PR (so the bot can flag intent), and a crash between those
-    two steps would otherwise strand the issue — assigned-to-self but with no
-    PR, invisible to both the assignee filter and the branch dedup. We skip
-    only issues assigned to *someone else*, which is a human claiming the work.
-    """
-    issues = gh_json(
-        "issue", "list", "--repo", repo,
-        "--state", "open",
-        "--json", "number,title,labels,assignees",
-        "--limit", "20",
-    )
-    open_bot_prs = gh_json(
-        "pr", "list", "--repo", repo,
-        "--state", "open",
-        "--json", "headRefName",
-        "--limit", "100",
-    )
-    claimed_nums = set()
-    for pr in open_bot_prs:
-        n = _issue_num_from_branch(pr.get("headRefName", ""))
-        if n is not None:
-            claimed_nums.add(n)
-
-    me = bot_login()
-    actionable = []
-    for issue in issues:
-        others = [a for a in issue.get("assignees", []) if a.get("login") != me]
-        if others:
-            continue
-        if issue["number"] in claimed_nums:
-            continue
-        actionable.append(issue)
-    # Prefer issues with good-first-issue or help-wanted labels
-    preferred = {"good first issue", "good-first-issue", "help wanted", "help-wanted"}
-    def sort_key(issue: dict) -> int:
-        labels = {l["name"].lower() for l in issue.get("labels", [])}
-        return 0 if labels & preferred else 1
-    actionable.sort(key=sort_key)
-    return actionable
+def janitor_clear_stale_claims(repo: str, max_age_hours: float = IN_PROGRESS_MAX_AGE_HOURS) -> None:
+    """Clear bot:in-progress claims older than max_age_hours (dead workers)."""
+    now = datetime.now(timezone.utc)
+    for num in sorted(get_in_progress_prs(repo)):
+        labeled_at = _in_progress_labeled_at(repo, num)
+        if labeled_at is None:
+            continue  # can't date the claim — leave it for a human
+        age_hours = (now - labeled_at).total_seconds() / 3600
+        if age_hours > max_age_hours:
+            log(f"Janitor: clearing stale bot:in-progress on #{num} (claimed {age_hours:.1f}h ago)")
+            remove_in_progress(repo, num)
 
 
 def route(repo: str) -> tuple[str, dict] | None:
     """Find highest-priority actionable work. Returns (phase_name, context) or None."""
-    in_progress = get_in_progress_prs(repo)
+    janitor_clear_stale_claims(repo)
+    # Skip active claims and PRs parked as bot:failed (human unlabels to retry).
+    skip = get_in_progress_prs(repo) | get_failed_prs(repo)
 
     for pr in check_review_requested(repo):
-        if pr["number"] not in in_progress:
+        if pr["number"] not in skip:
             return ("phase6_process_review", {"repo": repo, "pr": pr})
 
     for pr in check_plan_feedback(repo):
-        if pr["number"] not in in_progress:
+        if pr["number"] not in skip:
             return ("phase2_process_feedback", {"repo": repo, "pr": pr})
 
     for pr in check_accepted_plans(repo):
-        if pr["number"] not in in_progress:
+        if pr["number"] not in skip:
             return ("phase4_implement", {"repo": repo, "pr": pr})
 
-    for issue in check_unclaimed_issues(repo):
-        return ("phase1_claim_and_plan", {"repo": repo, "issue": issue})
+    issues = check_unclaimed_issues(repo)
+    if issues:
+        # WIP limit: don't open new plans while too many await a human.
+        if open_plan_count(repo) >= WIP_LIMIT:
+            log(f"WIP limit reached ({WIP_LIMIT} open plans) — not claiming new issues")
+        else:
+            return ("phase1_claim_and_plan", {"repo": repo, "issue": issues[0]})
 
     return None
 
@@ -540,9 +685,9 @@ def phase1_claim_and_plan(repo: str, issue: dict) -> tuple[str, dict] | None:
     issue_comments = gh(
         "issue", "view", str(num), "--repo", repo,
         "--json", "comments",
-        "--jq", r'.comments[] | "\(.author.login) (\(.createdAt)): \(.body)"',
+        "--jq", TRUSTED_COMMENTS_JQ,
     ) or "(none)"
-    conventions = read_repo_conventions(repo)
+    root = _repo_root()
     recent_prs = gh(
         "pr", "list", "--repo", repo, "--state", "merged",
         "--limit", "5", "--json", "title,body",
@@ -551,34 +696,47 @@ def phase1_claim_and_plan(repo: str, issue: dict) -> tuple[str, dict] | None:
     slug = slugify(title)
     branch = f"bot/{num}-{slug}"
     default_branch = gh("repo", "view", repo, "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name")
-    git("checkout", default_branch)
-    git("pull", "--ff-only")
+    # The main clone is never checked out or pulled here — the plan branch
+    # is cut from the freshly fetched default branch, inside a worktree.
+    git_retry("fetch", "origin", default_branch, cwd=root)
+    # A worktree left by a failed earlier attempt holds only the empty plan
+    # commit; clear it through the usual gate, which refuses (loudly) if it
+    # is dirty or holds unpushed work.
+    stale = Worktree(root, branch)
+    if os.path.isdir(stale.path):
+        stale.cleanup()
     # Clean up stale local branch from a previous failed run
     try:
-        git("branch", "-D", branch)
+        git("branch", "-D", branch, cwd=root)
     except RuntimeError:
         pass
     # Also delete any stale remote branch — a prior phase1 may have pushed
     # before failing, leaving a remote ref that would cause non-fast-forward
     # rejection when we push the fresh branch built from the default branch.
     try:
-        git("push", "origin", "--delete", branch)
+        git("push", "origin", "--delete", branch, cwd=root)
     except RuntimeError:
         pass
-    git("checkout", "-b", branch)
-    git("commit", "--allow-empty", "-m", f"plan: {title} (#{num})")
-    git("push", "-u", "origin", branch)
+    with Worktree(root, branch, base=f"origin/{default_branch}") as wt:
+        git("commit", "--allow-empty", "-m", f"plan: {title} (#{num})", cwd=wt.path)
+        # Explicit refspec, no -u: upstream tracking writes shared .git/config,
+        # which contends across concurrent worktree workers (spike 0.1).
+        git_retry("push", "origin", f"HEAD:{branch}", cwd=wt.path)
 
-    prompt = load_prompt(
-        "phase1_claim_and_plan",
-        issue_number=str(num),
-        issue_title=title,
-        issue_body=issue_body or "(no description)",
-        issue_comments=issue_comments,
-        conventions=conventions,
-        recent_prs=recent_prs,
-    )
-    plan = llm_reason(prompt)
+        prompt = load_prompt(
+            "phase1_claim_and_plan",
+            issue_number=str(num),
+            issue_title=title,
+            issue_body=issue_body or "(no description)",
+            issue_comments=issue_comments,
+            conventions=read_repo_conventions(repo, cwd=wt.path),
+            recent_prs=recent_prs,
+        )
+        # Plan against the default branch's code, not whatever the main
+        # clone has checked out.
+        plan = llm_reason(
+            prompt, log_name=f"issue-{num}-phase1_claim_and_plan", workdir=wt.path,
+        )
     plan_body = _strip_outer_fence(plan)
     # Always append `Closes #N` on its own line, outside any fence, so GitHub
     # links the PR to the issue (the LLM often buries it inside a code block).
@@ -607,7 +765,7 @@ def phase2_process_feedback(repo: str, pr: dict) -> tuple[str, dict] | None:
     pr_comments = gh(
         "pr", "view", str(num), "--repo", repo,
         "--json", "comments",
-        "--jq", r'.comments[] | "\(.author.login) (\(.createdAt)): \(.body)"',
+        "--jq", TRUSTED_COMMENTS_JQ,
     )
     plan_body = gh("pr", "view", str(num), "--repo", repo, "--json", "body", "-q", ".body")
 
@@ -620,7 +778,7 @@ def phase2_process_feedback(repo: str, pr: dict) -> tuple[str, dict] | None:
             issue_comments = gh(
                 "issue", "view", str(issue_num), "--repo", repo,
                 "--json", "comments",
-                "--jq", r'.comments[] | "\(.author.login) (\(.createdAt)): \(.body)"',
+                "--jq", TRUSTED_COMMENTS_JQ,
             )
             if issue_comments:
                 parts.append(f"### Comments on linked issue #{issue_num}\n{issue_comments}")
@@ -635,7 +793,7 @@ def phase2_process_feedback(repo: str, pr: dict) -> tuple[str, dict] | None:
         plan_body=plan_body,
         comments=comments,
     )
-    result = llm_reason(prompt)
+    result = llm_reason(prompt, log_name=f"pr-{num}-phase2_process_feedback")
     parsed = parse_claude_json(result)
 
     if not parsed or "action" not in parsed:
@@ -689,10 +847,10 @@ def phase4_implement(repo: str, pr: dict) -> tuple[str, dict] | None:
     plan = gh("pr", "view", str(num), "--repo", repo, "--json", "body", "-q", ".body")
     branch = get_pr_branch(repo, num)
 
-    git("fetch", "origin", branch)
-    git("clean", "-fd")
-    git("checkout", branch)
-    git("pull", "--ff-only", "origin", branch)
+    # The main clone is never checked out, cleaned, or pulled here — all
+    # work happens in an isolated worktree on the PR branch.
+    root = _repo_root()
+    git("fetch", "origin", branch, cwd=root)
 
     prompt = load_prompt(
         "phase4_implement",
@@ -701,8 +859,10 @@ def phase4_implement(repo: str, pr: dict) -> tuple[str, dict] | None:
         repo=repo,
         branch=branch,
     )
-    workdir = git("rev-parse", "--show-toplevel")
-    llm_interactive(prompt, workdir)
+    with Worktree(root, branch) as wt:
+        # A pre-existing local branch may lag the remote; catch up ff-only.
+        git("merge", "--ff-only", f"origin/{branch}", cwd=wt.path)
+        llm_interactive(prompt, wt.path, log_name=f"pr-{num}-phase4_implement")
 
     log(f"Phase 4 complete: implementation done for PR #{num}")
     return ("phase5_post_implementation", {"repo": repo, "pr": pr})
@@ -735,6 +895,10 @@ def phase6_process_review(repo: str, pr: dict) -> tuple[str, dict] | None:
     add_in_progress(repo, num)
 
     reviews = fetch_review_payload(repo, num)
+    if not _has_review_feedback(reviews):
+        log(f"Phase 6: no review from a trusted account on PR #{num}; nothing to do")
+        remove_in_progress(repo, num)
+        return None
 
     prompt = load_prompt(
         "phase6_process_review",
@@ -742,7 +906,7 @@ def phase6_process_review(repo: str, pr: dict) -> tuple[str, dict] | None:
         pr_title=pr["title"],
         reviews=reviews,
     )
-    result = llm_reason(prompt)
+    result = llm_reason(prompt, log_name=f"pr-{num}-phase6_process_review")
     parsed = parse_claude_json(result)
 
     if not parsed or "action" not in parsed:
@@ -760,9 +924,9 @@ def phase6_process_review(repo: str, pr: dict) -> tuple[str, dict] | None:
 
     if action == "changes_requested":
         branch = get_pr_branch(repo, num)
-        git("fetch", "origin", branch)
-        git("checkout", branch)
-        git("pull", "--ff-only", "origin", branch)
+        # Never touch the main clone's checkout — fixes happen in a worktree.
+        root = _repo_root()
+        git("fetch", "origin", branch, cwd=root)
 
         fix_prompt = load_prompt(
             "phase6_apply_fixes",
@@ -771,8 +935,9 @@ def phase6_process_review(repo: str, pr: dict) -> tuple[str, dict] | None:
             reviews=reviews,
             branch=branch,
         )
-        workdir = git("rev-parse", "--show-toplevel")
-        llm_interactive(fix_prompt, workdir)
+        with Worktree(root, branch) as wt:
+            git("merge", "--ff-only", f"origin/{branch}", cwd=wt.path)
+            llm_interactive(fix_prompt, wt.path, log_name=f"pr-{num}-phase6_apply_fixes")
 
         review_data = json.loads(reviews)
         review_nodes = review_data.get("reviews", {}).get("nodes", []) if isinstance(review_data.get("reviews"), dict) else review_data.get("reviews", [])
@@ -803,18 +968,27 @@ PHASES: dict[str, callable] = {
 }
 
 
-def bootstrap_repo(repo: str) -> None:
-    """Ensure the repo is cloned and default branch is synced."""
+def bootstrap_repo(repo: str, sync: bool = True) -> None:
+    """Ensure the repo is cloned, record REPO_ROOT, and optionally sync.
+
+    `sync=True` (legacy loop behavior) checks out and ff-pulls the default
+    branch. `run` mode passes `sync=False`: each phase fetches exactly what
+    it needs, and worktree-based phases must never have the main clone's
+    checkout moved underneath them.
+    """
+    global REPO_ROOT
     # Check if we're already inside the target repo
     try:
         current_repo = gh("repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner")
         if current_repo == repo:
-            default_branch = gh(
-                "repo", "view", repo,
-                "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name",
-            )
-            git("checkout", default_branch)
-            git("pull", "--ff-only")
+            REPO_ROOT = git("rev-parse", "--show-toplevel", cwd=os.getcwd())
+            if sync:
+                default_branch = gh(
+                    "repo", "view", repo,
+                    "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name",
+                )
+                git("checkout", default_branch, cwd=REPO_ROOT)
+                git("pull", "--ff-only", cwd=REPO_ROOT)
             return
     except RuntimeError:
         pass
@@ -822,35 +996,155 @@ def bootstrap_repo(repo: str) -> None:
     repo_name = repo.split("/")[-1]
     if os.path.isdir(repo_name):
         os.chdir(repo_name)
-        default_branch = gh(
-            "repo", "view", repo,
-            "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name",
-        )
-        git("checkout", default_branch)
-        git("pull", "--ff-only")
+        REPO_ROOT = os.getcwd()
+        if sync:
+            default_branch = gh(
+                "repo", "view", repo,
+                "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name",
+            )
+            git("checkout", default_branch, cwd=REPO_ROOT)
+            git("pull", "--ff-only", cwd=REPO_ROOT)
         log(f"Entered existing clone: {repo}")
     else:
         gh("repo", "clone", repo)
         os.chdir(repo_name)
+        REPO_ROOT = os.getcwd()
         log(f"Cloned and entered {repo}")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Code Factory — autonomous GitHub contributions")
-    parser.add_argument("agent", nargs="?", choices=("claude", "codex"), help="agent CLI to use")
-    parser.add_argument("--agent", dest="agent_flag", choices=("claude", "codex"), help="agent CLI to use")
-    parser.add_argument("--repo", help="owner/repo (default: current repo)")
-    parser.add_argument("--once", action="store_true", help="single pass, then exit")
-    args = parser.parse_args()
-    agent = args.agent_flag or args.agent or "claude"
+# Accepted spellings for `run --phase`: bare number, phaseN, or full name.
+RUN_PHASE_ALIASES: dict[str, str] = {}
+for _name in PHASES:
+    _num = _name.split("_", 1)[0].removeprefix("phase")
+    RUN_PHASE_ALIASES[_name] = _name
+    RUN_PHASE_ALIASES[_num] = _name
+    RUN_PHASE_ALIASES[f"phase{_num}"] = _name
 
-    global AGENT_CLI
-    AGENT_CLI = agent
 
-    load_env()
-    if "GH_TOKEN" in os.environ:
-        log(f"Using GH_TOKEN from {ENV_FILE.name}")
+def run_chain(start: tuple[str, dict]) -> bool:
+    """Execute one phase chain to completion. Returns True on success.
 
+    Failure protection (task 2.4): a WorktreeCleanupRefused parks the PR as
+    bot:failed immediately (unpushed/dirty state needs a human); any other
+    failure increments the consecutive-failure counter, and the second in a
+    row parks the PR with the log tail. Success clears the counter.
+    """
+    phase_name, ctx = start
+    try:
+        next_result = start
+        while next_result:
+            phase_name, ctx = next_result
+            phase_fn = PHASES[phase_name]
+            next_result = phase_fn(**ctx)
+        pr = ctx.get("pr")
+        if pr:
+            clear_failures(ctx["repo"], pr["number"])
+        return True
+    except Exception as e:
+        log(f"Error in {phase_name}: {e}")
+        pr = ctx.get("pr")
+        if pr:
+            repo, num = ctx["repo"], pr["number"]
+            try:
+                remove_in_progress(repo, num)
+            except Exception:
+                pass
+            unit = f"pr-{num}" if "pr" in ctx else f"issue-{num}"
+            log_path = _log_path(f"{unit}-{phase_name}")
+            try:
+                if isinstance(e, WorktreeCleanupRefused):
+                    mark_failed(repo, num, f"{phase_name}: {e}", log_path)
+                    clear_failures(repo, num)
+                else:
+                    count = record_failure(repo, num)
+                    if count >= FAILURE_THRESHOLD:
+                        mark_failed(
+                            repo, num,
+                            f"{phase_name} failed {count} consecutive times; last error: {e}",
+                            log_path,
+                        )
+                        clear_failures(repo, num)
+            except Exception as protect_err:
+                log(f"Failure-protection error on #{num}: {protect_err}")
+        return False
+
+
+def build_parser() -> argparse.ArgumentParser:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--repo", help="owner/repo (default: current repo)")
+    common.add_argument("--agent", choices=("claude", "codex"), help="agent CLI to use (default: claude)")
+    common.add_argument(
+        "--timeout-minutes", type=float, default=None, metavar="M",
+        help="wall-clock limit per agent invocation (default: 30); a timeout fails the phase",
+    )
+
+    parser = argparse.ArgumentParser(
+        description="Code Factory — autonomous GitHub contributions",
+        parents=[common],
+    )
+    parser.add_argument(
+        "--loop", action="store_true",
+        help="[DEPRECATED] run the polling loop that routes and executes work "
+             "until interrupted; superseded by dispatcher-driven `run` invocations",
+    )
+    parser.add_argument("--once", action="store_true", help="with --loop: single poll pass, then exit")
+
+    sub = parser.add_subparsers(dest="command")
+    run_p = sub.add_parser(
+        "run", parents=[common],
+        help="execute exactly one phase chain, then exit (nonzero on failure)",
+        description="Execute exactly one unit of work: a phase chain for one "
+                    "PR (--pr N --phase X) or the plan phase for one issue "
+                    "(--issue N). Exits 0 on success, 1 on failure.",
+    )
+    unit = run_p.add_mutually_exclusive_group(required=True)
+    unit.add_argument("--pr", type=int, metavar="N", help="PR number to act on")
+    unit.add_argument("--issue", type=int, metavar="N", help="issue number to plan (phase 1)")
+    run_p.add_argument(
+        "--phase", metavar="X",
+        help="phase to run for --pr: 2|4|5|6, phaseN, or the full name "
+             "(e.g. phase4_implement); required with --pr",
+    )
+    return parser
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    repo = get_repo(args.repo)
+    log(f"Code Factory run: {repo} (agent: {AGENT_CLI})")
+    # sync=False: locate the clone only. `run` must not move the main
+    # clone's checkout — phases fetch exactly what they need.
+    bootstrap_repo(repo, sync=False)
+
+    if args.issue is not None:
+        if args.phase and RUN_PHASE_ALIASES.get(args.phase) != "phase1_claim_and_plan":
+            log("--issue always runs phase 1; --phase is only valid with --pr")
+            return 2
+        issue = gh_json(
+            "issue", "view", str(args.issue), "--repo", repo,
+            "--json", "number,title",
+        )
+        start = ("phase1_claim_and_plan", {"repo": repo, "issue": issue})
+    else:
+        if not args.phase:
+            log("--phase is required with --pr")
+            return 2
+        phase_name = RUN_PHASE_ALIASES.get(args.phase)
+        if phase_name is None or phase_name == "phase1_claim_and_plan":
+            valid = ", ".join(sorted(n for n in PHASES if n != "phase1_claim_and_plan"))
+            log(f"Unknown phase {args.phase!r} for --pr; valid: {valid}")
+            return 2
+        pr = gh_json(
+            "pr", "view", str(args.pr), "--repo", repo,
+            "--json", "number,title,headRefName",
+        )
+        start = (phase_name, {"repo": repo, "pr": pr})
+
+    ok = run_chain(start)
+    return 0 if ok else 1
+
+
+def cmd_loop(args: argparse.Namespace) -> int:
+    """[DEPRECATED] Legacy polling loop — poll, route, execute, repeat."""
     repo = get_repo(args.repo)
     log(f"Code Factory targeting: {repo} (agent: {AGENT_CLI})")
     bootstrap_repo(repo)
@@ -860,22 +1154,9 @@ def main() -> None:
         result = route(repo)
 
         if result:
-            phase_name, ctx = result
+            phase_name, _ = result
             log(f"Work found — starting {phase_name}")
-            try:
-                next_result = result
-                while next_result:
-                    phase_name, ctx = next_result
-                    phase_fn = PHASES[phase_name]
-                    next_result = phase_fn(**ctx)
-            except Exception as e:
-                log(f"Error in {phase_name}: {e}")
-                pr = ctx.get("pr")
-                if pr:
-                    try:
-                        remove_in_progress(repo, pr["number"])
-                    except Exception:
-                        pass
+            run_chain(result)
         else:
             log("No actionable work found.")
 
@@ -885,6 +1166,30 @@ def main() -> None:
         sleep_time = 5 if result else 300
         log(f"Sleeping {sleep_time} seconds...")
         time.sleep(sleep_time)
+    return 0
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+
+    global AGENT_CLI, PHASE_TIMEOUT_SECONDS
+    AGENT_CLI = args.agent or "claude"
+    if args.timeout_minutes:
+        PHASE_TIMEOUT_SECONDS = args.timeout_minutes * 60
+
+    load_env()
+    if "GH_TOKEN" in os.environ:
+        log(f"Using GH_TOKEN from {ENV_FILE.name}")
+
+    if args.command == "run":
+        sys.exit(cmd_run(args))
+
+    # No subcommand: the legacy polling loop, kept until the dispatcher
+    # (plane 2) replaces it. Explicit --loop is preferred over the bare
+    # invocation, which stays only for compatibility.
+    if not args.loop:
+        log("DEPRECATED: implicit polling loop — use `run --pr/--issue` per unit, or pass --loop explicitly.")
+    sys.exit(cmd_loop(args))
 
 
 if __name__ == "__main__":
