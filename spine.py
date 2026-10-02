@@ -3,7 +3,7 @@
 
 The layer between all actors (orchestrator, gates, factory) and remote
 GitHub state: label vocabulary and transitions, tier path-globs, branch
-naming, WIP limit, and the queue queries. A library, not a process —
+naming, WIP limit, per-repo config, and the queue queries. A library, not a process —
 GitHub itself remains the only coordinator.
 
 Rule (enforced by a test in tests/test_spine.py): spine never imports
@@ -12,6 +12,7 @@ code_factory or any phase logic.
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 import shlex
@@ -80,7 +81,7 @@ def bot_login() -> str:
 
 # --- Schema ---
 # The one place the state machine is written down: label vocabulary, legal
-# transitions, WIP limit, branch naming, and per-repo tier path-globs.
+# transitions, WIP limit, branch naming, and where per-repo config lives.
 # `bot:in-progress` is a claim marker orthogonal to the state labels, and
 # `bot:failed` is reachable from any state (a human unlabels to retry), so
 # neither appears as a transition source below.
@@ -107,34 +108,14 @@ SCHEMA = {
     # review; only accounts with a standing relationship to the repo may
     # move a PR (GitHub's authorAssociation values).
     "trusted_review_associations": ("OWNER", "MEMBER", "COLLABORATOR"),
-    # Tier path-globs, per repo (fnmatch syntax; `*` crosses slashes, so
-    # `dir/**` and `dir/*` both match nested paths — when in doubt, tier A).
-    # Anything not matching A or B is tier C. Curunir's A set was widened
-    # after the spike 0.2 backlog dry-run (dev_stack notes/
-    # backlog-classification.md): src/channels/** is the agent's transport
-    # layer (both [security] path-traversal PRs and the unauthenticated-
-    # listener fix classified C without it); schemas.py/delegate.py are the
-    # tool-parse and delegation critical path; run.py is a fat critical
-    # entrypoint touched by 19 of 53 diffed PRs.
-    "tier_globs": {
-        "jalemieux/curunir": {
-            "A": (
-                "src/agent/**",
-                "src/channels/**",
-                "src/llm.py",
-                "src/tools/dispatcher.py",
-                "src/tools/schemas.py",
-                "src/tools/delegate.py",
-                "run.py",
-                "portal/ws_*",
-            ),
-            "B": ("skills/**", "personas/**"),
-        },
-    },
+    # Tier path-globs are not part of the schema: each target repo declares
+    # its own in CONFIG_PATH on its default branch (see repo_config()).
+    "config_path": ".codefactory.yml",
 }
 
 WIP_LIMIT = SCHEMA["wip_limit"]
 TRUSTED_REVIEW_ASSOCIATIONS = SCHEMA["trusted_review_associations"]
+CONFIG_PATH = SCHEMA["config_path"]
 
 
 def is_trusted_reviewer(author_association: str | None) -> bool:
@@ -160,6 +141,100 @@ def trusted_logins(repo: str) -> frozenset[str]:
     return frozenset(json.loads(gh(
         "api", f"repos/{repo}/collaborators", "--paginate", "--jq", "[.[].login]",
     ) or "[]"))
+
+
+# --- Per-repo config ---
+# Risk tiers are a property of the target repo, so they live there, in
+# CONFIG_PATH, and the factory works on any repo its token can reach. The
+# file is read from the DEFAULT branch through the contents API, never from
+# the PR branch: otherwise a PR could edit the file to demote itself to
+# tier C and auto-merge. Shape:
+#
+#   tiers:
+#     A: ["src/agent/**", "run.py"]     # human review, never auto-merged
+#     B: ["skills/**"]                  # human-merged until evals exist
+#   # anything else is tier C
+#
+# fnmatch syntax: `*` crosses slashes, so `dir/**` and `dir/*` both match
+# nested paths — when in doubt, tier A.
+
+
+class RepoConfigError(RuntimeError):
+    """CONFIG_PATH exists in the repo but is not usable. Never swallowed: a
+    broken file must not silently classify everything as tier C."""
+
+
+def _fetch_config_text(repo: str) -> str | None:
+    """Raw CONFIG_PATH from the repo's default branch, or None if absent."""
+    try:
+        payload = gh("api", f"repos/{repo}/contents/{CONFIG_PATH}")
+    except RuntimeError as e:
+        if "404" in str(e):
+            return None
+        raise
+    data = json.loads(payload)
+    if data.get("encoding") != "base64":
+        raise RepoConfigError(f"{repo}:{CONFIG_PATH}: unexpected encoding {data.get('encoding')!r}")
+    return base64.b64decode(data["content"]).decode("utf-8")
+
+
+def _parse_config(text: str, where: str) -> dict:
+    try:
+        import yaml  # PyYAML; imported lazily so spine loads without it
+    except ImportError as e:  # pragma: no cover
+        raise RepoConfigError("PyYAML is required to read %s (pip install pyyaml)" % where) from e
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as e:
+        raise RepoConfigError(f"{where}: invalid YAML: {e}") from e
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise RepoConfigError(f"{where}: top level must be a mapping")
+    tiers = data.get("tiers", {})
+    if tiers is None:
+        tiers = {}
+    if not isinstance(tiers, dict):
+        raise RepoConfigError(f"{where}: `tiers` must be a mapping of tier -> list of globs")
+    normalized = {}
+    for tier, globs in tiers.items():
+        tier = str(tier).upper()
+        if tier not in ("A", "B"):
+            raise RepoConfigError(f"{where}: unknown tier {tier!r} (only A and B take globs; the rest is C)")
+        if globs is None:
+            globs = []
+        if isinstance(globs, str):
+            globs = [globs]
+        if not isinstance(globs, list) or not all(isinstance(g, str) and g for g in globs):
+            raise RepoConfigError(f"{where}: tiers.{tier} must be a list of non-empty glob strings")
+        normalized[tier] = tuple(globs)
+    data["tiers"] = normalized
+    return data
+
+
+@lru_cache(maxsize=None)
+def repo_config(repo: str) -> dict:
+    """Parsed CONFIG_PATH for `repo` (default branch). {} when the file is
+    absent. Cached per repo for the life of the process — one unit of work."""
+    text = _fetch_config_text(repo)
+    if text is None:
+        log(f"{repo}: no {CONFIG_PATH} on the default branch — every diff classifies as tier C")
+        return {}
+    return _parse_config(text, f"{repo}:{CONFIG_PATH}")
+
+
+def tier_globs(repo: str) -> dict[str, tuple[str, ...]]:
+    """{"A": globs, "B": globs} for the repo; missing tiers are empty."""
+    tiers = repo_config(repo).get("tiers", {})
+    return {"A": tuple(tiers.get("A", ())), "B": tuple(tiers.get("B", ()))}
+
+
+def tiers_configured(repo: str) -> bool:
+    """Whether the repo declares any tier globs at all. A repo with no
+    config classifies everything as C, which an auto-merge gate should
+    treat as 'unconfigured', not 'safe'."""
+    return bool(repo_config(repo).get("tiers"))
+
 
 # Strictest first — used to resolve mixed-tier diffs.
 TIERS = ("A", "B", "C")
@@ -197,8 +272,13 @@ def classify(
     repo: str,
     title: str | None = None,
     labels: list | None = None,
+    *,
+    globs: dict | None = None,
 ) -> str:
-    """Classify a diff into a tier by the paths it touches. Pure — no network.
+    """Classify a diff into a tier by the paths it touches.
+
+    Globs come from the repo's CONFIG_PATH (one cached fetch per process);
+    pass `globs={"A": [...], "B": [...]}` to classify without the network.
 
     Security override first: '[security]' in the title or a security label
     forces tier A regardless of globs (spike 0.2 caught three security fixes
@@ -215,7 +295,8 @@ def classify(
         return "A"
     if not changed_files:
         return PLAN
-    globs = SCHEMA["tier_globs"].get(repo, {})
+    if globs is None:
+        globs = tier_globs(repo)
     strictest = "C"
     for path in changed_files:
         if any(fnmatchcase(path, g) for g in globs.get("A", ())):
