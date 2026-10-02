@@ -18,6 +18,7 @@ from pathlib import Path
 # GitHub state-machine primitives live in spine (see agentic-stack-v2.md);
 # this file keeps the phase logic and drives them.
 from spine import (
+    CONFIG_PATH,
     PHASE2_MARKER,
     TRUSTED_COMMENTS_JQ,
     WIP_LIMIT,
@@ -30,6 +31,7 @@ from spine import (
     check_plan_feedback,
     check_review_requested,
     check_unclaimed_issues,
+    classify,
     ensure_labels,
     get_failed_prs,
     get_in_progress_prs,
@@ -42,6 +44,7 @@ from spine import (
     remove_in_progress,
     slugify,
     swap_label,
+    tiers_configured,
 )
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
@@ -884,8 +887,53 @@ def phase5_post_implementation(repo: str, pr: dict) -> tuple[str, dict] | None:
     gh("pr", "ready", str(num), "--repo", repo)
     swap_label(repo, num, "bot:plan-accepted", "bot:review-requested")
     remove_in_progress(repo, num)
-    log(f"Phase 5 complete: PR #{num} marked ready for review")
+    tier = request_auto_merge(repo, num)
+    log(f"Phase 5 complete: PR #{num} marked ready for review (tier {tier})")
     return None
+
+
+def pr_changed_paths(repo: str, num: int) -> list[str]:
+    """Every path the PR touches. The REST files endpoint is paginated, so
+    unlike `gh pr view --json files` it does not stop at the first 100 —
+    a tier-A file on page two must still count."""
+    out = gh("api", f"repos/{repo}/pulls/{num}/files", "--paginate", "--jq", ".[].filename")
+    return [line for line in out.splitlines() if line]
+
+
+def request_auto_merge(repo: str, num: int) -> str:
+    """Task 3.3: queue a squash auto-merge, for tier C only.
+
+    Tier A never auto-merges; B stays human-merged until evals exist. A
+    repo without a .codefactory.yml classifies everything as C by default,
+    which is 'unconfigured', not 'safe', so it is skipped too. GitHub
+    completes the merge only when branch protection is satisfied (required
+    checks green, required approvals present), so this queues rather than
+    merges. Failure to queue is logged and commented, never raised: the PR
+    is already ready and labeled, and a human can merge it by hand.
+    """
+    meta = gh_json("pr", "view", str(num), "--repo", repo, "--json", "title,labels")
+    title = meta.get("title", "") if isinstance(meta, dict) else ""
+    labels = meta.get("labels", []) if isinstance(meta, dict) else []
+    tier = classify(pr_changed_paths(repo, num), repo, title=title, labels=labels)
+    if tier != "C":
+        log(f"Phase 5: PR #{num} is tier {tier} — left for a human to merge")
+        return tier
+    if not tiers_configured(repo):
+        log(f"Phase 5: PR #{num} is tier C only because {repo} has no {CONFIG_PATH}; not auto-merging")
+        return tier
+    try:
+        gh("pr", "merge", str(num), "--repo", repo, "--auto", "--squash")
+    except RuntimeError as e:
+        reason = str(e).splitlines()[-1][:200]
+        log(f"Phase 5: could not queue auto-merge for PR #{num}: {reason}")
+        gh("pr", "comment", str(num), "--repo", repo, "--body",
+           f"Tier C, but auto-merge could not be queued: `{reason}`. Merge by hand once checks pass.")
+        return tier
+    log(f"Phase 5: PR #{num} is tier C — auto-merge (squash) queued")
+    gh("pr", "comment", str(num), "--repo", repo, "--body",
+       "Tier C: auto-merge (squash) queued. GitHub merges this PR once the required "
+       "checks pass and branch protection's review requirement is met.")
+    return tier
 
 
 def phase6_process_review(repo: str, pr: dict) -> tuple[str, dict] | None:

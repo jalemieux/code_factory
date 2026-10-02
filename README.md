@@ -118,6 +118,11 @@ diff is a plan draft, not a tier; a `[security]` title or security label
 forces tier A. Without the file every diff is tier C and the factory logs
 a warning, so add it before enabling any auto-merge.
 
+After implementation the factory queues a squash auto-merge for tier C
+PRs only; A and B wait for a human. GitHub completes the merge when the
+branch protection rules are met, so turn on **Allow auto-merge** in the
+repo settings and make `tests` and `factory-gate` required checks.
+
 ## Project Structure
 
 ```

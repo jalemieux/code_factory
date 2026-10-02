@@ -86,8 +86,12 @@ refuse to auto-merge on it. A present-but-broken file raises
   then phase 4 implement, then phase 1 new issues (only if under the WIP
   limit). `bot:in-progress` and `bot:failed` PRs are skipped. A human
   removes `bot:failed` to retry.
-- Phase 5 marks the PR ready and swaps labels. It does not yet request
-  auto-merge (that is plan task 3.3).
+- Phase 5 marks the PR ready, swaps labels, then (task 3.3) classifies
+  the final diff with `spine.classify` over the paginated files endpoint
+  and queues `gh pr merge --auto --squash` only for tier C on a repo that
+  has a `.codefactory.yml`. A and B are left for a human. GitHub performs
+  the merge only once branch protection is satisfied, so a required
+  review still gates it. A failed queue is commented on the PR, not raised.
 
 ## How to run and test
 
@@ -170,6 +174,18 @@ repo-specific data from spine: tier globs moved to a `.codefactory.yml` in
 each target repo, so the factory can work on any repo its token reaches.
 The two-worker smoke on curunir and tasks 3.2 onward are still owed; 3.2
 (`factory-gate`) should read the same file.
+
+## Update 2026-10-02, later
+
+- 3.1 merged (curunir #559, the `tests` check).
+- 3.2 merged (curunir #564): `factory-gate` runs on `pull_request_target`,
+  reads `.codefactory.yml` and the script from the base branch, fails on
+  an empty diff or a broken config. Rules vendored from `spine.classify`.
+- 3.3 is on branch `auto-merge` in this repo (see runtime behaviour above).
+- **Still owed by the operator**, both one API call: require `tests` and
+  `factory-gate` as status checks on curunir `main`, and set
+  `allow_auto_merge=true` on the repo (it is off, so the queue call fails
+  with a comment until then).
 
 ## Next steps, per the plan
 

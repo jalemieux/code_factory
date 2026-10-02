@@ -469,11 +469,12 @@ class TestParseClaudeJson(unittest.TestCase):
 
 
 class TestPhase5(unittest.TestCase):
+    @patch("code_factory.request_auto_merge", return_value="B")
     @patch("code_factory.remove_in_progress")
     @patch("code_factory.swap_label")
     @patch("code_factory.gh")
     @patch("code_factory.gh_json")
-    def test_marks_ready_when_files_changed(self, mock_json, mock_gh, mock_swap, mock_remove):
+    def test_marks_ready_when_files_changed(self, mock_json, mock_gh, mock_swap, mock_remove, mock_auto):
         mock_json.return_value = 3
         result = code_factory.phase5_post_implementation(
             repo="owner/repo", pr={"number": 5, "title": "Fix"}
@@ -482,6 +483,9 @@ class TestPhase5(unittest.TestCase):
         mock_gh.assert_any_call("pr", "ready", "5", "--repo", "owner/repo")
         mock_swap.assert_called_once_with("owner/repo", 5, "bot:plan-accepted", "bot:review-requested")
         mock_remove.assert_called_once_with("owner/repo", 5)
+        # Task 3.3: the auto-merge decision runs after the PR is ready and
+        # unclaimed, so a failure there can never strand the claim.
+        mock_auto.assert_called_once_with("owner/repo", 5)
 
     @patch("code_factory.gh_json")
     def test_raises_when_no_files_changed(self, mock_json):
@@ -491,6 +495,80 @@ class TestPhase5(unittest.TestCase):
                 repo="owner/repo", pr={"number": 5, "title": "Fix"}
             )
         self.assertIn("0 changed files", str(ctx.exception))
+
+
+class TestRequestAutoMerge(unittest.TestCase):
+    """Task 3.3: only tier C on a configured repo queues an auto-merge."""
+
+    def _run(self, files, tier_cfg=True, title="Fix", labels=None, merge_error=None):
+        calls = []
+
+        def fake_gh(*args):
+            calls.append(args)
+            if args[:2] == ("api", "repos/owner/repo/pulls/5/files"):
+                return "\n".join(files)
+            if args[:2] == ("pr", "merge") and merge_error:
+                raise RuntimeError(merge_error)
+            return ""
+
+        meta = {"title": title, "labels": labels or []}
+        with patch("code_factory.gh", side_effect=fake_gh), \
+             patch("code_factory.gh_json", return_value=meta), \
+             patch("code_factory.tiers_configured", return_value=tier_cfg), \
+             patch("code_factory.classify", wraps=lambda f, r, title=None, labels=None:
+                   "A" if any(p.startswith("core/") for p in f) or "[security]" in (title or "").lower()
+                   else "B" if any(p.startswith("plugins/") for p in f) else "C"):
+            tier = code_factory.request_auto_merge("owner/repo", 5)
+        merges = [c for c in calls if c[:2] == ("pr", "merge")]
+        comments = [c for c in calls if c[:2] == ("pr", "comment")]
+        return tier, merges, comments
+
+    def test_tier_c_queues_squash_auto_merge(self):
+        tier, merges, comments = self._run(["README.md", "docs/a.md"])
+        self.assertEqual(tier, "C")
+        self.assertEqual(merges, [("pr", "merge", "5", "--repo", "owner/repo", "--auto", "--squash")])
+        self.assertEqual(len(comments), 1)
+        self.assertIn("auto-merge (squash) queued", comments[0][-1])
+
+    def test_tier_a_never_auto_merges(self):
+        tier, merges, comments = self._run(["README.md", "core/x.py"])
+        self.assertEqual(tier, "A")
+        self.assertEqual(merges, [])
+        self.assertEqual(comments, [])
+
+    def test_security_title_never_auto_merges(self):
+        tier, merges, _ = self._run(["README.md"], title="[security] docs")
+        self.assertEqual(tier, "A")
+        self.assertEqual(merges, [])
+
+    def test_tier_b_stays_human_merged(self):
+        tier, merges, _ = self._run(["plugins/p.py"])
+        self.assertEqual(tier, "B")
+        self.assertEqual(merges, [])
+
+    def test_unconfigured_repo_is_not_safe(self):
+        # No .codefactory.yml means everything looks like C; that is
+        # "unconfigured", not a merge decision.
+        tier, merges, _ = self._run(["README.md"], tier_cfg=False)
+        self.assertEqual(tier, "C")
+        self.assertEqual(merges, [])
+
+    def test_queue_failure_is_commented_not_raised(self):
+        tier, merges, comments = self._run(
+            ["README.md"], merge_error="gh pr merge (exit 1): Pull request is not mergeable: auto-merge is not allowed"
+        )
+        self.assertEqual(tier, "C")
+        self.assertEqual(len(merges), 1)
+        self.assertEqual(len(comments), 1)
+        self.assertIn("could not be queued", comments[0][-1])
+        self.assertIn("auto-merge is not allowed", comments[0][-1])
+
+    def test_changed_paths_use_paginated_files_endpoint(self):
+        with patch("code_factory.gh", return_value="a.py\nb/c.py\n") as gh:
+            self.assertEqual(code_factory.pr_changed_paths("owner/repo", 5), ["a.py", "b/c.py"])
+        gh.assert_called_once_with(
+            "api", "repos/owner/repo/pulls/5/files", "--paginate", "--jq", ".[].filename"
+        )
 
 
 class TestPhase2(unittest.TestCase):
