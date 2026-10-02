@@ -98,13 +98,35 @@ Claude will create labels automatically if missing, but you can pre-create:
 
 - `bot:plan-accepted` — triggers the implement workflow when a plan is approved
 
+### 5. Declare risk tiers: `.codefactory.yml`
+
+Each target repository tells the factory which paths are critical. Add a
+`.codefactory.yml` at the repo root (see
+[`docs/codefactory.example.yml`](docs/codefactory.example.yml)):
+
+```yaml
+tiers:
+  A: ["src/core/**", "run.py"]   # always human-reviewed, never auto-merged
+  B: ["plugins/**"]              # human-merged until evals exist
+# anything else is tier C
+```
+
+The file is read from the default branch through the GitHub API, so a PR
+cannot lower its own tier. Globs use `fnmatch` syntax (`*` crosses
+slashes). A diff takes the strictest tier of any file it touches; an empty
+diff is a plan draft, not a tier; a `[security]` title or security label
+forces tier A. Without the file every diff is tier C and the factory logs
+a warning, so add it before enabling any auto-merge.
+
 ## Project Structure
 
 ```
 .github/workflows/
   plan.yml                # Issue opened → draft PR with plan; PR comments → feedback loop
   implement.yml           # Plan approved → TDD implementation, push, mark ready
-code_factory.py           # Legacy local script (polling-based alternative)
+code_factory.py           # Local runner: `run --pr N --phase X` / `run --issue N`
+spine.py                  # GitHub state machine: labels, transitions, tiers, per-repo config
+docs/codefactory.example.yml  # Template for a target repo's .codefactory.yml
 prompts/                  # Prompt templates (used by local script)
 tests/
   test_code_factory.py    # Unit tests
@@ -112,7 +134,7 @@ tests/
 
 ## Legacy: Local Script
 
-An older polling-based approach is also available via `code_factory.py`. It requires the Claude Code CLI, `gh` CLI, and Python 3 installed locally.
+An older polling-based approach is also available via `code_factory.py`. It requires the Claude Code CLI, `gh` CLI, and Python 3 installed locally, plus `pip install -r requirements.txt` (PyYAML, for reading each repo's `.codefactory.yml`).
 
 ```bash
 python3 code_factory.py --repo owner/repo       # Continuous polling

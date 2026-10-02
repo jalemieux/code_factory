@@ -55,9 +55,16 @@ those to tier C and auto-merge an empty commit on green tests. So
 label forces tier A regardless of globs. Spike 0.2 found three security
 fixes that would otherwise have classified as C.
 
-**Tier A globs for curunir were widened after the spike** to include
-`src/channels/**`, `src/tools/schemas.py`, `src/tools/delegate.py`, and
-`run.py`. Rationale is in the comment above `SCHEMA["tier_globs"]`.
+**Tier globs live in the target repo, not in spine.** Since 2026-10-02
+`spine.repo_config(repo)` reads `.codefactory.yml` from the repo's default
+branch (contents API, no `ref=`, so a PR cannot demote itself) and
+`classify()` takes its globs from there. Curunir's set (widened after the
+spike to include `src/channels/**`, `src/tools/schemas.py`,
+`src/tools/delegate.py`, and `run.py`) now lives in curunir's own
+`.codefactory.yml`. A repo without the file classifies everything as C;
+`spine.tiers_configured(repo)` is False in that case and task 3.3 must
+refuse to auto-merge on it. A present-but-broken file raises
+`RepoConfigError` rather than silently classifying as C.
 
 **Mixed-tier diffs take the strictest tier.** Order is A, B, C.
 
@@ -154,6 +161,15 @@ Curunir itself now has an interaction limit of collaborators only
 (expires 2027-03-27), and `main` has branch protection requiring one
 approval from a user with write access, admins exempt. The bot token
 cannot read that protection and gets a 404.
+
+## Update 2026-10-02
+
+`v2-spine` merged into `main` as PR #2 on 2026-09-27; this document now
+describes `main`. Branch `repo-config` (after it) removes the last
+repo-specific data from spine: tier globs moved to a `.codefactory.yml` in
+each target repo, so the factory can work on any repo its token reaches.
+The two-worker smoke on curunir and tasks 3.2 onward are still owed; 3.2
+(`factory-gate`) should read the same file.
 
 ## Next steps, per the plan
 

@@ -1,0 +1,28 @@
+# .codefactory.yml — per-repo settings read by Code Factory.
+#
+# Put this file at the root of the TARGET repository (the one the bot works
+# on). The bot reads it from the default branch through the GitHub API, never
+# from a PR branch, so a PR cannot change its own tier.
+#
+# Risk tiers decide how much human review a diff gets. Paths use fnmatch
+# syntax: `*` crosses slashes, so `dir/**` and `dir/*` both match nested
+# paths. A diff takes the strictest tier of any file it touches.
+#
+#   A  critical path — always human-reviewed, never auto-merged
+#   B  medium risk — human-merged until evals exist
+#   C  everything else (no globs; it is the default)
+#
+# An empty diff is never a tier (it is a plan draft), and a `[security]`
+# title or a security label forces tier A regardless of globs.
+#
+# Without this file every diff is tier C, which an auto-merge gate should
+# treat as "unconfigured", not "safe".
+
+tiers:
+  A:
+    - src/core/**
+    - src/auth/**
+    - run.py
+  B:
+    - plugins/**
+    - docs/runbooks/**

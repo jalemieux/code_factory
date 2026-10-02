@@ -1,3 +1,5 @@
+import base64
+import json
 import re
 import unittest
 from pathlib import Path
@@ -6,6 +8,44 @@ from unittest.mock import patch
 import spine
 
 CURUNIR = "jalemieux/curunir"
+
+# Curunir's tiers as they stood in SCHEMA before they moved into the repo's
+# own .codefactory.yml. Kept here because the classify tests below document
+# fnmatch edge cases (prefix globs, sibling dirs) against a realistic set.
+CURUNIR_GLOBS = {
+    "A": (
+        "src/agent/**",
+        "src/channels/**",
+        "src/llm.py",
+        "src/tools/dispatcher.py",
+        "src/tools/schemas.py",
+        "src/tools/delegate.py",
+        "run.py",
+        "portal/ws_*",
+    ),
+    "B": ("skills/**", "personas/**"),
+}
+
+
+def _fake_repo_config(repo):
+    return {"tiers": CURUNIR_GLOBS} if repo == CURUNIR else {}
+
+
+class _ConfiguredRepo(unittest.TestCase):
+    """classify() reads globs through repo_config(); stub it so these tests
+    stay offline and the curunir set is the fixture."""
+
+    def setUp(self):
+        patcher = patch.object(spine, "repo_config", side_effect=_fake_repo_config)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
+def _contents_payload(text):
+    return json.dumps({
+        "encoding": "base64",
+        "content": base64.b64encode(text.encode()).decode(),
+    })
 
 
 class TestNoPhaseImports(unittest.TestCase):
@@ -56,7 +96,7 @@ class TestLegalTransition(unittest.TestCase):
             self.assertTrue(spine.legal_transition(old, "bot:failed"))
 
 
-class TestClassify(unittest.TestCase):
+class TestClassify(_ConfiguredRepo):
     def test_tier_a_exact_file(self):
         self.assertEqual(spine.classify(["src/llm.py"], CURUNIR), "A")
 
@@ -123,8 +163,91 @@ class TestClassify(unittest.TestCase):
     def test_run_py_is_tier_a(self):
         self.assertEqual(spine.classify(["run.py"], CURUNIR), "A")
 
+    def test_explicit_globs_bypass_repo_config(self):
+        globs = {"A": ("danger/**",), "B": ()}
+        with patch.object(spine, "repo_config", side_effect=AssertionError("network")):
+            self.assertEqual(spine.classify(["danger/x.py"], "any/repo", globs=globs), "A")
+            self.assertEqual(spine.classify(["safe.py"], "any/repo", globs=globs), "C")
 
-class TestSecurityOverride(unittest.TestCase):
+
+class TestRepoConfig(unittest.TestCase):
+    """CONFIG_PATH is fetched once per repo from the default branch via the
+    contents API and parsed into {"tiers": {"A": (...), "B": (...)}}."""
+
+    def setUp(self):
+        spine.repo_config.cache_clear()
+        self.addCleanup(spine.repo_config.cache_clear)
+
+    def test_reads_tiers_from_default_branch_contents_api(self):
+        text = "tiers:\n  A: [\"src/core/**\", \"run.py\"]\n  B:\n    - docs/**\n"
+        with patch.object(spine, "gh", return_value=_contents_payload(text)) as gh:
+            cfg = spine.repo_config("o/r")
+        self.assertEqual(cfg["tiers"], {"A": ("src/core/**", "run.py"), "B": ("docs/**",)})
+        # No `ref=` on purpose: the contents API serves the default branch,
+        # so a PR cannot demote itself by editing the file on its own branch.
+        gh.assert_called_once_with("api", "repos/o/r/contents/.codefactory.yml")
+        self.assertEqual(spine.tier_globs("o/r"), cfg["tiers"])
+        self.assertTrue(spine.tiers_configured("o/r"))
+
+    def test_classify_uses_repo_config(self):
+        text = "tiers:\n  A: [\"src/core/**\"]\n"
+        with patch.object(spine, "gh", return_value=_contents_payload(text)):
+            self.assertEqual(spine.classify(["src/core/x.py"], "o/r"), "A")
+            self.assertEqual(spine.classify(["README.md"], "o/r"), "C")
+
+    def test_missing_file_means_no_tiers(self):
+        err = RuntimeError("gh api repos/o/r/contents/.codefactory.yml (exit 1): gh: Not Found (HTTP 404)")
+        with patch.object(spine, "gh", side_effect=err):
+            self.assertEqual(spine.repo_config("o/r"), {})
+            self.assertEqual(spine.tier_globs("o/r"), {"A": (), "B": ()})
+            self.assertFalse(spine.tiers_configured("o/r"))
+            self.assertEqual(spine.classify(["src/anything.py"], "o/r"), "C")
+
+    def test_other_gh_errors_propagate(self):
+        with patch.object(spine, "gh", side_effect=RuntimeError("gh: Bad credentials (HTTP 401)")):
+            with self.assertRaises(RuntimeError):
+                spine.repo_config("o/r")
+
+    def test_cached_per_repo(self):
+        with patch.object(spine, "gh", return_value=_contents_payload("tiers: {A: [a/**]}")) as gh:
+            spine.repo_config("o/r")
+            spine.repo_config("o/r")
+            spine.classify(["a/b"], "o/r")
+            spine.repo_config("o/other")
+        self.assertEqual(gh.call_count, 2)
+
+    def test_only_a_and_b_take_globs(self):
+        with patch.object(spine, "gh", return_value=_contents_payload("tiers: {C: [x]}")):
+            with self.assertRaises(spine.RepoConfigError):
+                spine.repo_config("o/r")
+
+    def test_lowercase_tier_keys_and_single_string_accepted(self):
+        with patch.object(spine, "gh", return_value=_contents_payload("tiers:\n  a: src/**\n  b: []\n")):
+            self.assertEqual(spine.tier_globs("o/r"), {"A": ("src/**",), "B": ()})
+
+    def test_invalid_yaml_is_an_error_not_tier_c(self):
+        with patch.object(spine, "gh", return_value=_contents_payload("tiers: [unclosed")):
+            with self.assertRaises(spine.RepoConfigError):
+                spine.repo_config("o/r")
+
+    def test_non_mapping_shapes_are_errors(self):
+        for text in ("- just\n- a list\n", "tiers: 42\n", "tiers: {A: [1, 2]}\n", "tiers: {A: ['']}\n"):
+            spine.repo_config.cache_clear()
+            with patch.object(spine, "gh", return_value=_contents_payload(text)):
+                with self.assertRaises(spine.RepoConfigError, msg=text):
+                    spine.repo_config("o/r")
+
+    def test_empty_file_means_no_tiers(self):
+        with patch.object(spine, "gh", return_value=_contents_payload("# nothing yet\n")):
+            self.assertEqual(spine.repo_config("o/r"), {})
+            self.assertFalse(spine.tiers_configured("o/r"))
+
+    def test_schema_no_longer_hardcodes_any_repo(self):
+        self.assertNotIn("tier_globs", spine.SCHEMA)
+        self.assertEqual(spine.SCHEMA["config_path"], ".codefactory.yml")
+
+
+class TestSecurityOverride(_ConfiguredRepo):
     def test_security_title_forces_tier_a_regardless_of_globs(self):
         self.assertEqual(
             spine.classify(["README.md"], CURUNIR, title="[security] path traversal fix"),
