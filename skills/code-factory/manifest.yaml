@@ -1,0 +1,12 @@
+name: code-factory
+
+cli: [gh, git, python3]
+
+pip:
+  - "pyyaml>=6"
+
+secrets:
+  - name: GH_TOKEN
+    required: false
+    description: "Bot identity for the factory, set in .env next to code_factory.py (with GIT_AUTHOR_NAME and GIT_AUTHOR_EMAIL). Fine-grained PAT with Contents, Pull requests and Issues read+write on each target repo. Without it the factory acts as your own gh login."
+    url: "https://github.com/settings/personal-access-tokens"

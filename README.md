@@ -123,6 +123,21 @@ PRs only; A and B wait for a human. GitHub completes the merge when the
 branch protection rules are met, so turn on **Allow auto-merge** in the
 repo settings and make `tests` and `factory-gate` required checks.
 
+## Use it from your coding agent
+
+`skills/code-factory/` is an [Agent Skill](https://agentskills.io) that
+teaches any harness to operate the factory: check a repo's setup, list
+actionable work, run one unit, read the tier, and onboard a new repo.
+
+```bash
+skills/code-factory/scripts/install.sh    # symlinks into ~/.claude/skills and ~/.agents/skills
+```
+
+Those two locations cover Claude Code, Codex CLI, GitHub Copilot and
+OpenCode. Then ask the agent, for example, "what factory work is waiting
+on owner/repo?". The skill's `scripts/cf` wrapper also works by hand:
+`cf doctor owner/repo`, `cf queue owner/repo`, `cf run --repo owner/repo --issue N`.
+
 ## Project Structure
 
 ```
@@ -132,6 +147,7 @@ repo settings and make `tests` and `factory-gate` required checks.
 code_factory.py           # Local runner: `run --pr N --phase X` / `run --issue N`
 spine.py                  # GitHub state machine: labels, transitions, tiers, per-repo config
 docs/codefactory.example.yml  # Template for a target repo's .codefactory.yml
+skills/code-factory/      # Agent skill + `cf` wrapper for Claude Code, Codex, Copilot, OpenCode
 prompts/                  # Prompt templates (used by local script)
 tests/
   test_code_factory.py    # Unit tests
