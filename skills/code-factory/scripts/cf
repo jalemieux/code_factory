@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""cf — thin, harness-neutral front end to Code Factory.
+
+  cf root                      print the code_factory checkout this skill drives
+  cf doctor [owner/repo]       check prerequisites (and a target repo's setup)
+  cf queue owner/repo          list actionable work with the command for each
+  cf tier owner/repo PR        classify one PR's risk tier (read-only)
+  cf run <args...>             code_factory.py run <args...>, from the workspace
+
+Read-only except `run`. The checkout is found from this file's real path
+(the skill directory is normally a symlink into the checkout), or from
+CODE_FACTORY_HOME. Target repos are cloned under CODE_FACTORY_WORKSPACE
+(default: <checkout>/workspace).
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+def find_root() -> Path:
+    env = os.environ.get("CODE_FACTORY_HOME")
+    candidates = [Path(env).expanduser()] if env else []
+    candidates.append(Path(os.path.realpath(__file__)).parents[3])
+    for c in candidates:
+        if (c / "code_factory.py").is_file() and (c / "spine.py").is_file():
+            return c
+    sys.exit(
+        "cf: cannot find the code_factory checkout. Set CODE_FACTORY_HOME to the "
+        "directory containing code_factory.py (git clone https://github.com/jalemieux/code_factory)."
+    )
+
+
+ROOT = find_root()
+WORKSPACE = Path(os.environ.get("CODE_FACTORY_WORKSPACE", ROOT / "workspace")).expanduser()
+
+
+def load_factory():
+    """Import code_factory + spine with the bot identity from .env applied."""
+    sys.path.insert(0, str(ROOT))
+    import code_factory  # noqa: E402
+    import spine  # noqa: E402
+
+    code_factory.load_env()
+    return code_factory, spine
+
+
+def sh(*args: str) -> tuple[int, str]:
+    r = subprocess.run(args, capture_output=True, text=True)
+    return r.returncode, (r.stdout.strip() or r.stderr.strip())
+
+
+# --- doctor -----------------------------------------------------------------
+
+def doctor(repo: str | None) -> int:
+    bad = 0
+
+    def row(ok, label, detail=""):
+        nonlocal bad
+        mark = {True: "ok  ", False: "FAIL", None: "warn"}[ok]
+        if ok is False:
+            bad += 1
+        print(f"[{mark}] {label}" + (f" — {detail}" if detail else ""))
+
+    row(True, "code_factory checkout", str(ROOT).replace(str(Path.home()), "~"))
+    for tool in ("gh", "git"):
+        row(shutil.which(tool) is not None, f"{tool} on PATH")
+    try:
+        import yaml  # noqa: F401
+        row(True, "PyYAML importable")
+    except ImportError:
+        row(False, "PyYAML importable", f"pip install -r {ROOT}/requirements.txt")
+    agents = [a for a in ("claude", "codex") if shutil.which(a)]
+    row(bool(agents), "worker agent CLI", ", ".join(agents) or "need `claude` or `codex` on PATH (--agent)")
+
+    env_file = ROOT / ".env"
+    has_token = env_file.is_file() and any(
+        line.startswith("GH_TOKEN=") and line.strip() != "GH_TOKEN=" for line in env_file.read_text().splitlines()
+    )
+    row(True if has_token else None, ".env with GH_TOKEN",
+        "" if has_token else "missing: the factory will act as your own gh login (cp .env.example .env)")
+
+    cf, spine = load_factory()
+    try:
+        login = spine.bot_login()
+        row(True, "GitHub identity", login)
+    except RuntimeError as e:
+        row(False, "GitHub identity", str(e)[-160:])
+        return 1
+
+    if not repo:
+        print("\n(no repo given: pass owner/repo to check a target repository)")
+        return 1 if bad else 0
+
+    print(f"\nTarget repo {repo}")
+    code, out = sh("gh", "api", f"repos/{repo}", "--jq",
+                   "[.permissions.push, .allow_auto_merge, .default_branch] | @tsv")
+    if code != 0:
+        row(False, "token can reach repo", out[-160:])
+        return 1
+    push, auto_merge, default = (out.split("\t") + ["", "", ""])[:3]
+    row(push == "true", "token has push access")
+    try:
+        cfg = spine.repo_config(repo)
+        tiers = cfg.get("tiers", {})
+        row(True if tiers else None, f"{spine.CONFIG_PATH} on {default}",
+            f"A: {len(tiers.get('A', ()))} globs, B: {len(tiers.get('B', ()))} globs" if tiers
+            else "absent or empty: everything is tier C and nothing auto-merges (see references/onboard-repo.md)")
+    except Exception as e:  # RepoConfigError or gh failure
+        row(False, f"{spine.CONFIG_PATH} on {default}", str(e)[-200:])
+    code, _ = sh("gh", "api", f"repos/{repo}/contents/.github/workflows/factory-gate.yml", "--jq", ".name")
+    row(True if code == 0 else None, "factory-gate workflow", "" if code == 0 else "not installed")
+    # allow_auto_merge is only visible to admins; blank means "cannot tell".
+    row(True if auto_merge == "true" else None, "repo allows auto-merge",
+        "" if auto_merge == "true" else ("off: tier C PRs get a 'could not be queued' comment" if auto_merge == "false"
+                                         else "not visible to this token"))
+    code, out = sh("gh", "api", f"repos/{repo}/branches/{default}/protection/required_status_checks",
+                   "--jq", "[.checks[].context] | join(\",\")")
+    if code == 0:
+        need = {"tests", "factory-gate"} - set(out.split(","))
+        row(True if not need else None, "required checks", out + (f" (missing: {', '.join(sorted(need))})" if need else ""))
+    else:
+        row(None, "required checks", "none configured, or not visible to this token")
+    code, out = sh("gh", "label", "list", "--repo", repo, "--limit", "200", "--json", "name", "--jq", ".[].name")
+    missing = sorted(set(spine.SCHEMA["labels"].values()) - set(out.splitlines())) if code == 0 else []
+    row(True if code == 0 and not missing else None, "bot:* labels",
+        "missing (created on first run): " + ", ".join(missing) if missing else "")
+    return 1 if bad else 0
+
+
+# --- queue ------------------------------------------------------------------
+
+def queue(repo: str, as_json: bool) -> int:
+    cf, spine = load_factory()
+    skip = spine.get_in_progress_prs(repo) | spine.get_failed_prs(repo)
+    items = []
+
+    def add(kind, phase, things, key="number"):
+        for t in things:
+            n = t[key]
+            if kind != "issue" and n in skip:
+                continue
+            flag = f"--issue {n}" if kind == "issue" else f"--pr {n} --phase {phase}"
+            items.append({"kind": kind, "number": n, "title": t.get("title", ""), "phase": phase,
+                          "command": f"cf run --repo {repo} {flag}"})
+
+    add("review", 6, spine.check_review_requested(repo))
+    add("plan-feedback", 2, spine.check_plan_feedback(repo))
+    add("accepted-plan", 4, spine.check_accepted_plans(repo))
+    open_plans = spine.open_plan_count(repo)
+    add("issue", 1, spine.check_unclaimed_issues(repo))
+    state = {
+        "repo": repo, "open_plans": open_plans, "wip_limit": spine.WIP_LIMIT,
+        "in_progress": sorted(spine.get_in_progress_prs(repo)), "failed": sorted(spine.get_failed_prs(repo)),
+        "items": items,
+    }
+    if as_json:
+        print(json.dumps(state, indent=1))
+        return 0
+    print(f"{repo}: {open_plans} open plans (WIP limit {spine.WIP_LIMIT}); "
+          f"in-progress {state['in_progress'] or 'none'}; failed {state['failed'] or 'none'}")
+    if open_plans >= spine.WIP_LIMIT:
+        print("WIP limit reached: prefer finishing PRs over planning new issues.")
+    if not items:
+        print("Nothing actionable.")
+    for it in items:
+        print(f"\n[{it['kind']}] #{it['number']} {it['title'][:70]}\n    {it['command']}")
+    return 0
+
+
+def tier(repo: str, pr: str) -> int:
+    cf, spine = load_factory()
+    files = cf.pr_changed_paths(repo, int(pr))
+    meta = spine.gh_json("pr", "view", pr, "--repo", repo, "--json", "title,labels")
+    t = spine.classify(files, repo, title=meta.get("title"), labels=meta.get("labels"))
+    auto = t == "C" and spine.tiers_configured(repo)
+    print(f"#{pr}: tier {t} ({len(files)} files) — " + (
+        "auto-merge would be queued" if auto else
+        "plan draft, not mergeable" if t == spine.PLAN else "human merge"))
+    return 0
+
+
+def run(args: list[str]) -> int:
+    WORKSPACE.mkdir(parents=True, exist_ok=True)
+    return subprocess.call([sys.executable, str(ROOT / "code_factory.py"), "run", *args], cwd=WORKSPACE)
+
+
+def main(argv: list[str]) -> int:
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "root":
+        print(ROOT)
+        return 0
+    if cmd == "doctor":
+        return doctor(rest[0] if rest else None)
+    if cmd == "queue" and rest:
+        return queue(rest[0], "--json" in rest)
+    if cmd == "tier" and len(rest) == 2:
+        return tier(rest[0], rest[1])
+    if cmd == "run":
+        return run(rest)
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,58 @@
+name: factory-gate
+
+# Classifies every PR into a Code Factory risk tier (A/B/C) from
+# .codefactory.yml and reports it as the `factory-gate` check. Meant to be a
+# required status check on main, so it has no path filters.
+#
+# Why pull_request_target: the workflow, the script and .codefactory.yml are
+# all taken from the BASE branch, so a PR cannot edit the gate that judges
+# it. The PR head is never checked out or executed; the only PR-controlled
+# inputs are file names, the title and labels, passed as data through
+# environment variables.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: factory-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  factory-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tier: ${{ steps.gate.outputs.tier }}
+
+    steps:
+      - name: Checkout base branch (gate rules and script)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          sparse-checkout: |
+            .codefactory.yml
+            .github/scripts
+          sparse-checkout-cone-mode: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML
+        run: pip install --quiet "pyyaml>=6"
+
+      - name: Classify
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: python3 .github/scripts/factory_gate.py

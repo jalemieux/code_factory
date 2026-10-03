@@ -5,3 +5,6 @@ logs/
 # target-repo clones made by bootstrap_repo when run from this checkout
 curunir/
 curunir-evals/
+
+# target-repo clones made by skills/code-factory/scripts/cf
+workspace/
